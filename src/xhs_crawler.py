@@ -848,6 +848,11 @@ class XhsCrawler:
                     pass
             if self._is_search_page(page):
                 self._dump_search_card_dom(page, note_id)
+            # 若真实点击已撞 404（<a> 默认硬导航，token 是占位假 token），
+            # token URL 兜底必仍 404，不再无谓重试，直接失败由上层优雅跳过
+            if self._is_404(page):
+                self._log("warn", "  [nav] 真实点击已撞 404（硬导航），跳过 token URL 重试")
+                return False
             self._log("warn", "  [nav] 真实点击未进入详情，尝试 token URL 兜底")
 
         # ── 策略 2：token URL 直接 goto（兜底，可能仍 404）──
@@ -1178,6 +1183,51 @@ class XhsCrawler:
         except Exception:
             pass
 
+    def _ensure_card_in_dom(self, page: Page, note_id: str) -> bool:
+        """在搜索结果页滚动定位目标卡片，确保其在 DOM 中（搜索页是虚拟滚动列表，
+        靠后的卡片需滚入视口才会渲染）。
+
+        返回 True 表示页面已存在该卡片的 DOM 节点（已尽量滚动到其附近）。
+        若滚到底层仍未渲染（可能该帖子确实不在结果中），返回 False，由调用方
+        决定是诊断 dump 还是优雅跳过，而不是盲目回退 token URL 撞 404。
+        """
+        try:
+            def _found() -> bool:
+                try:
+                    return bool(page.evaluate("""(nid) => {
+                        if (document.querySelectorAll("[data-note-id='" + nid + "']").length) return true;
+                        var as = document.querySelectorAll("a[href*='" + nid + "']");
+                        return as.length > 0;
+                    }""", note_id))
+                except Exception:
+                    return False
+
+            if _found():
+                return True
+
+            # 先回到列表顶部，再逐屏向下滚动触发虚拟列表渲染
+            page.evaluate("() => window.scrollTo(0, 0)")
+            time.sleep(0.5)
+            last_h = page.evaluate("() => document.body.scrollHeight")
+            for _ in range(25):
+                page.mouse.wheel(0, 700)
+                time.sleep(0.6)
+                if _found():
+                    return True
+                h = page.evaluate("() => document.body.scrollHeight")
+                if h == last_h:
+                    # 高度不再增长，可能已到底；再等两次确认没有新内容
+                    page.mouse.wheel(0, 700)
+                    time.sleep(0.8)
+                    if _found():
+                        return True
+                    break
+                last_h = h
+            return False
+        except Exception as e:
+            self._log("warn", f"    滚动定位卡片失败: {e}")
+            return False
+
     def _dump_search_card_dom(self, page: Page, note_id: str):
         """点击失败后导出搜索结果页中目标卡片的真实 DOM（outerHTML）。
 
@@ -1191,6 +1241,8 @@ class XhsCrawler:
             _os.makedirs(log_dir, exist_ok=True)
             ts = int(time.time())
             path = _os.path.join(log_dir, f"debug_search_card_{note_id}_{ts}.html")
+            # 先尽力滚动定位，让虚拟列表渲染该卡片
+            self._ensure_card_in_dom(page, note_id)
             html = page.evaluate("""(nid) => {
                 try {
                     // 优先按 data-note-id 定位卡片根元素
@@ -1207,7 +1259,10 @@ class XhsCrawler:
                             return as[j].outerHTML;
                         }
                     }
-                    return 'CARD_NOT_FOUND_ON_PAGE';
+                    // 仍找不到：列出当前页面已渲染的全部卡片 note_id，便于判断是否在结果中
+                    var ids = [];
+                    byId.forEach(function (el) { ids.push(el.getAttribute('data-note-id')); });
+                    return 'CARD_NOT_FOUND_ON_PAGE\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
                 } catch (e) { return 'ERR:' + e.message; }
             }""", note_id)
             with open(path, "w", encoding="utf-8") as f:
@@ -1228,6 +1283,10 @@ class XhsCrawler:
         需在每次点击前先清除其 pointer-events 让真实事件穿透。每点一次都轮询详情。
         """
         try:
+            # 搜索页是虚拟滚动列表：先滚动定位，确保目标卡片已渲染进 DOM，
+            # 否则 query_selector_all 找不到元素 → 直接返回 False → 回退 token URL 撞 404
+            self._ensure_card_in_dom(page, note_id)
+
             # 候选定位（按优先级）：<a>链接 → data-note-id容器 → note-item区块
             candidates = [
                 (f"a[href*='{note_id}']", "卡片链接"),
