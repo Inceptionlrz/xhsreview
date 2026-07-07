@@ -880,14 +880,13 @@ class XhsCrawler:
         return not self._is_404(page)
 
     def _extract_search_tokens_from_cards(self, page: Page) -> Dict[str, str]:
-        """从搜索结果卡片 DOM 提取 note_id -> xsec_token（参考 rednote-crawler）。
+        """（参考 rednote-crawler）尝试从搜索结果卡片 DOM 提取 note_id -> xsec_token。
 
-        搜索卡片含两类链接：
-          1) 隐藏 <a href="/explore/{id}">（无 token，直跳 404）
-          2) 封面 <a class="cover" href="/search_result/{id}?xsec_token=...&xsec_source=...">
-             —— 真实可用的 token 就在封面链接的 href 里。
-        策略：遍历卡片，从封面链接抠 xsec_token（及 xsec_source），映射 note_id。
-        命中即返回，比 __INITIAL_STATE__（搜索页无有效 token）可靠得多。
+        ⚠️ 实测更新（2026-07-07）：当前 XHS 版本的搜索卡片 DOM 中【并不存在】
+        `a.cover` 或任何带 xsec_token 的链接——卡片仅含一个 `display:none` 的
+        SEO 占位 `<a href="/explore/{id}">`（无 token）。因此本方法在我们环境下
+        几乎必然返回空字典，调用方必须依赖「真实点击触发 Vue @click 注入 token」
+        作为唯一可靠导航路径。保留此方法仅作兜底（若 XHS 改版恢复了 a.cover）。
         """
         tokens: Dict[str, str] = {}
         try:
@@ -1385,24 +1384,25 @@ class XhsCrawler:
             self._ensure_card_in_dom(page, note_id)
             html = page.evaluate("""(nid) => {
                 try {
-                    // 优先按 data-note-id 定位卡片根元素
-                    var byId = document.querySelectorAll('[data-note-id]');
-                    for (var i = 0; i < byId.length; i++) {
-                        if (byId[i].getAttribute('data-note-id') === nid) {
-                            return byId[i].outerHTML;
+                    // 先定位承载 note_id 的 <a>（通常是 display:none 的 SEO 占位链接，
+                    // 也是 Vue @click 的挂载点），再上溯到最近的卡片语义祖先，
+                    // 导出其【完整 outerHTML】（含子节点），便于定位 @click 到底挂在哪。
+                    var a = document.querySelector("a[href*='" + nid + "']");
+                    if (a) {
+                        var el = a.parentElement;
+                        while (el && el !== document.body) {
+                            var cls = (typeof el.className === 'string') ? el.className : '';
+                            if (/note-item|cover|card|feed-item|\\bnote\\b/i.test(cls) || el.tagName === 'SECTION' || el.tagName === 'ARTICLE') {
+                                return el.outerHTML;
+                            }
+                            el = el.parentElement;
                         }
+                        return a.outerHTML;  // 兜底：仅占位 <a>
                     }
-                    // 退而求其次：含 note_id 的 <a>
-                    var as = document.querySelectorAll('a');
-                    for (var j = 0; j < as.length; j++) {
-                        if ((as[j].getAttribute('href') || '').indexOf(nid) >= 0) {
-                            return as[j].outerHTML;
-                        }
-                    }
-                    // 仍找不到：列出当前页面已渲染的全部卡片 note_id，便于判断是否在结果中
+                    // 找不到 <a>：列出当前页面已渲染的全部卡片 note_id
                     var ids = [];
-                    byId.forEach(function (el) { ids.push(el.getAttribute('data-note-id')); });
-                    return 'CARD_NOT_FOUND_ON_PAGE\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
+                    document.querySelectorAll('[data-note-id]').forEach(function (e) { ids.push(e.getAttribute('data-note-id')); });
+                    return 'A_TAG_NOT_FOUND\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
                 } catch (e) { return 'ERR:' + e.message; }
             }""", note_id)
             with open(path, "w", encoding="utf-8") as f:
@@ -1477,44 +1477,55 @@ class XhsCrawler:
             #   真实 Vue @click（注入 40+ 真实 token）挂在它的【父级卡片容器】上。
             #   直接点隐藏 <a> 会触发其默认硬导航（8 字符假 token → 404）。故：
             #   <a> 可见则点 <a>；<a> 隐藏则上溯到最接近的可见卡片容器再点。
-            target = self._resolve_search_click_target(page, note_id)
-            if target is None:
-                self._log("warn", "    未能解析到任何点击目标（卡片可能未渲染/已下架）")
-                return False
+            a = page.query_selector(f"a[href*='{note_id}']")
 
-            try:
-                # 若目标是父级容器（隐藏 <a> 的 decoy 情况）：点击前禁用内部 <a> 的
-                # 指针事件，确保真实点击命中承载 @click 的封面/容器，而非触发 <a> 默认
-                # 硬导航（哪怕 XHS 滚动后把 <a> 渲染成可见，也会被 pointer-events 穿透）
-                if (target.get_attribute("tagName") or "").upper() != "A":
+            # ── 策略 A：坐标级真实点击可见卡片区（最贴近真人点击）──
+            # ⚠️ 关键修正（2026-07-07 复盘）：绝不给承载 @click 的 <a> 设
+            # pointer-events:none —— 那样会杀死其 Vue @click 处理器，使真实点击穿透
+            # 到无 @click 的父容器 → 不导航 → 超时 → 回退 404。之前 5b940b6 的
+            # 该写法正是搜索卡片点击失败的元凶。
+            # 这里用 page.mouse.click 在可见卡片中心派发 trusted 事件，由浏览器命中
+            # 测试决定真正接收事件的元素（通常是封面/卡片容器，其 @click 会冒泡触发）。
+            target = self._resolve_search_click_target(page, note_id)
+            if target is not None:
+                try:
+                    self._clear_search_masks(page)  # 仅清视觉遮罩，绝不动 <a>
                     try:
-                        page.evaluate("""(nid) => {
-                            document.querySelectorAll(`a[href*='${nid}']`).forEach(a => {
-                                a.style.pointerEvents = 'none';
-                            });
-                        }""", note_id)
+                        target.scroll_into_view_if_needed(timeout=2000)
                     except Exception:
                         pass
-                # 每次点击前都重清遮罩（XHS 遮罩可能动态重建，会拦截 pointer events）
-                self._clear_search_masks(page)
+                    box = target.bounding_box()
+                    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                        cx = box["x"] + box["width"] / 2
+                        cy = box["y"] + box["height"] / 2
+                        page.mouse.click(cx, cy)
+                        self._log("info", f"    坐标点击可见卡片区 (含{note_id[:10]})")
+                        if self._wait_for_detail(page, note_id, timeout=6.0):
+                            return True
+                        self._log("warn", "    坐标点击后未进入详情（可能404）")
+                    else:
+                        # 目标无有效包围盒 → 退化为 force 元素点击
+                        target.click(timeout=4000, force=True)
+                        if self._wait_for_detail(page, note_id, timeout=6.0):
+                            return True
+                except Exception as e:
+                    self._log("warn", f"    坐标/元素点击失败: {e}")
+
+            # ── 策略 B：直接对 <a> 派发 click（绕过 display:none 与命中测试）──
+            # 若 @click 处理器就挂在 <a> 自身（display:none 不影响 addEventListener
+            # 触发），HTMLElement.click() 会直接唤起其 Vue @click → router.push 注入
+            # 真实 xsec_token。这是兜底中最可靠的一种：不依赖坐标命中、不依赖可见性。
+            if a is not None:
                 try:
-                    target.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-                # 真实点击：Playwright 派发 trusted 事件 → 触发 Vue @click → router.push 带真实 token
-                try:
-                    target.click(timeout=4000)
-                except Exception as e1:
-                    # 仍报拦截/不可见 → 二次清遮罩 + force 兜底
-                    self._clear_search_masks(page)
-                    self._log("warn", f"    普通点击失败({e1})，force 重试")
-                    target.click(timeout=4000, force=True)
-                self._log("info", f"    真实点击卡片容器 (含{note_id[:10]})")
-                if self._wait_for_detail(page, note_id, timeout=6.0):
-                    return True
-                self._log("warn", "    点击后未进入详情（可能404）")
-            except Exception as e:
-                self._log("warn", f"    点击卡片失败: {e}")
+                    page.evaluate("(el) => el.click()", a)
+                    self._log("info", f"    对 <a> 直接派发 click (含{note_id[:10]})")
+                    if self._wait_for_detail(page, note_id, timeout=6.0):
+                        return True
+                    self._log("warn", "    <a> click 后未进入详情")
+                except Exception as e:
+                    self._log("warn", f"    <a> click 失败: {e}")
+            else:
+                self._log("warn", "    未能解析到任何点击目标（卡片可能未渲染/已下架）")
             return False
         except Exception as e:
             self._log("warn", f"    搜索页点击卡片失败: {e}")

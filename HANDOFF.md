@@ -56,9 +56,27 @@
 - 推荐 feed 模式：正常，能点赞能评论。
 - 关键词搜索模式：进详情页全部 `未登录` / 404，评论发不出去。
 
+> 🔴 **交接后重大修正（2026-07-07 22:50 用户实测，务必先读）**
+> 我（前任开发者）先前在 `b239e9c` 里**错误地**认为「搜索卡片有 `a.cover` 带真 token、可 URL 直跳」。
+> **实测证伪**：用调试导出（`debug_search_click_target_*.html`）确认我们的 XHS 版本搜索卡片
+> **只有 `display:none` 的 `<a href="/explore/{id}">`，无任何 token、无 `a.cover`**。所以 `b239e9c`
+> 的「token 直跳优先」在运行时必然回退到点击，依然 404。
+>
+> **真正的根因（自我挖坑）**：`5b940b6`/`b239e9c` 时期给那个隐藏 `<a>` 设了
+> `pointer-events: none`（本意防硬导航），**但 `@click` 处理器恰恰挂在这个 `<a>` 上**——
+> 禁掉 pointer-events 等于杀死了 `@click`，真实点击穿透到无 `@click` 的父容器 → 不导航 → 404。
+> 这正是搜索卡片反复 404 的元凶。
+>
+> **修复（最新 commit，待运行时验证）**：删除对 `<a>` 的 pointer-events 禁用；改为
+> ① `page.mouse.click` 在**可见卡片中心**派发 trusted 事件（浏览器命中测试决定接收元素）；
+> ② 兜底对 `<a>` 直接 `el.click()`（绕过 display:none，唤起其 Vue @click → router.push 注入真 token）。
+> 详见 §3.4。
+
 ### 3.2 反爬机制（真相）
 - **推荐 feed**：卡片 `<a href>` 自带有效 `xsec_token` → 直接 `page.goto()` 可靠。
-- **关键词搜索**：卡片 `<a href>` **不含有效 token**。token 由 Vue Router 在 `@click` 时从数据注入，执行 `router.push`。
+- **关键词搜索**：卡片 DOM 实测**只有一条**链接——`display:none` 的 SEO 占位 `<a href="/explore/{id}">`（**无任何 token**）。**我们的 XHS 版本卡片里不存在 `a.cover`、也不存在任何带 `xsec_token` 的链接**（已用调试导出 `debug_search_click_target_*.html` 实锤确认）。因此：
+  - ❌ **无法**从卡片 DOM 抠出真 token 做 URL 直跳（参考的 rednote-crawler 之 `a.cover` 方案**不适用**于我们这套 XHS 版本）。
+  - ✅ **唯一可靠路径仍是「真实点击触发 Vue `@click`」**——Vue 在 `@click` 处理器里用运行时内存中的真实 `xsec_token` 做 `router.push`。注意：该 `@click` 处理器就挂在那个 `display:none` 的 `<a>` **自身**上（不是父容器）。
 - **404 特征**：URL 形如 `https://www.xiaohongshu.com/404?source=/404/sec_xxx?redirectPath=...`，`error_code=300031`，文案「当前笔记暂时无法浏览」。
 - **失败签名判定**：`redirectPath` 里 token 是 8 字符 `sec_xxx` → 说明触发了 `<a>` **默认硬导航**（假 token）。成功时 token 是 40+ 字符（Vue `router.push` 注入）。
 
@@ -76,12 +94,24 @@
 | `6faa35b` | 点击失败导出卡片 DOM 诊断 | 🔧 诊断埋点 |
 | `bee6ab6` | 点击前导出快照 + 回搜索页先等卡片渲染 | 🔧 定位到隐藏 `<a>` |
 | `5b940b6` | **隐藏 `<a>`(display:none) 占位链接修复 + 版本红框** | ✅ 理论修复，**未运行时验证** |
+| `b239e9c` | 参考 rednote-crawler，改为 token 直跳优先（从 `a.cover` 抠 token） | ❌ **实测证伪**：我们 DOM 无 `a.cover`/无 token，必然回退点击仍 404 |
+| `<最新>` | **删除 `<a>` 的 `pointer-events:none`（自我挖坑元凶）；改坐标级真实点击 + 对 `<a>` 直接 `el.click()` 兜底** | 🟡 待运行时验证 |
 
-### 3.4 最终修复要点（`5b940b6`，当前 HEAD）
-- 新增 `_resolve_search_click_target(page, note_id)`：
-  - `<a href*='note_id'>` **可见** → 点 `<a>`；
-  - `<a>` **隐藏**（display:none）→ 上溯到可见卡片容器（承载 `@click` 的父级）再点；
-  - **点击前把所有 `a[href*=note_id]` 的 `pointer-events` 设 `none`**，即使 XHS 滚动后把隐藏 `<a>` 渲染成可见，点击也穿透到承载 `@click` 的封面/容器，**绝不触发 `<a>` 默认硬导航**。这是死循环 404 的终结键。
+### 3.4 修复演进与最终策略（当前 HEAD = <最新 commit>）
+
+> ⚠️ **重大修正（务必读）**：`b239e9c` 的结论「搜索卡片有 `a.cover` 带真 token、可 URL 直跳」是**错的**。
+> 我们 XHS 版本的搜索卡片**没有** `a.cover`、也没有任何带 `xsec_token` 的链接（调试导出实锤）。
+> 因此 `b239e9c` 的「token 直跳优先」在运行时必然回退到点击，依旧 404。
+> **真实导航路径永远是「真实点击触发 Vue `@click`」**——token 由 @click 处理器从运行时内存注入。
+> - **新增 `_resolve_search_click_target`**：`<a>` 可见则点 `<a>`；`<a>` 隐藏则上溯到可见卡片容器。
+> - **⚠️ 关键修正**：**绝不给 `<a>` 设 `pointer-events:none`**！`@click` 就挂在那个 `display:none` 的
+>   `<a>` 自身上，禁掉它的 pointer-events = 杀死 @click = 点击穿透到无 @click 的父容器 = 不导航 = 404。
+>   （这是 `5b940b6`/`b239e9c` 时期搜索卡片死循环 404 的真正元凶，已被推翻。）
+> - **当前点击逻辑（`_click_note_card_on_search`）**：
+>   1. 策略 A：`page.mouse.click` 在**可见卡片中心**派发 trusted 事件（最贴近真人；浏览器命中测试
+>      决定真正接收事件的元素，通常是封面/卡片容器，其 @click 会冒泡触发）。**只清视觉遮罩，绝不动 `<a>` 的 pointer-events。**
+>   2. 策略 B（兜底）：直接对 `<a>` 调 `el.click()`（绕过 display:none 与命中测试，直接唤起其
+>      Vue @click → router.push 注入真 token）。这是兜底里最可靠的一种。
 - 诊断 dump 升级：快照里直接打印 `<a>` 的 `DISPLAY`/`VISIBILITY`，一眼看出是否占位链接。
 - GUI 左上角新增红色版本框，实时读 `git rev-parse --short HEAD`，排查时版本号与我 `git log` 对齐。
 
@@ -101,7 +131,7 @@
 3. **XHS 遮罩层会随 Vue 重渲染动态重建**：清一次 `pointer-events` 不够，**每次点击前都要重清**。
 4. **虚拟滚动列表**：`query_selector` 找不到元素，先怀疑「未滚动渲染」，不是「选择器错」。
 5. **诊断时序**：回搜索页 / dump 前，先轮询 `data-note-id` 数量稳定（`_wait_search_cards_rendered`），否则会拿到「卡片数=0」假阴性，误导判断。
-6. **隐藏 `<a>` 占位链接**：搜索卡片 DOM 不统一，SEO 占位 `<a>` 是 `display:none` 且无布局盒子，真 `@click` 在父容器。点它就触发默认硬导航。
+6. **隐藏 `<a>` 占位链接**：搜索卡片的 `<a href="/explore/{id}">` 是 `display:none` 的 SEO 占位链接，**且 Vue `@click` 处理器就挂在这个 `<a>` 自身上**（不是父容器）。因此**绝不能给这个 `<a>` 设 `pointer-events:none`**（会杀死 @click → 点击穿透到无 @click 的父容器 → 不导航 → 404）。正确做法：直接对它 `el.click()`，或点击其可见卡片区（坐标级 trusted click）。
 7. **token 长度即签名**：8 字符 `sec_xxx` = 失败（硬导航）；40+ 字符 = 成功（Vue 路由）。
 8. **Worker 线程隔离**：所有 Playwright 调用只在 Worker 内，外部走 `_cmd_queue`，别跨线程。
 
@@ -115,10 +145,13 @@
 | 搜索模式·可见 `<a>` 卡片 | ✅ 已验证 | `fdbd9a3` 后用户截图确认评论成功 |
 | 搜索模式·视频遮罩卡片 | ✅ 已验证 | `3ba3975` 截图确认详情加载 |
 | 搜索模式·靠后虚拟列表卡片 | 🟡 理论修复 | `212a6a7` 已推，但运行进程一直是旧版，未见端到端确认 |
-| 搜索模式·隐藏 `<a>` 占位卡片 | 🟡 **未运行时验证** | `5b940b6` 已推，但交接时运行进程仍是旧代码（PID 29864） |
+| 搜索模式·隐藏 `<a>` 占位卡片 | 🟡 **当前 HEAD 已修，待运行时验证** | 根因=给 `<a>` 设 `pointer-events:none` 杀死 @click；最新 commit 已删除该禁用、改坐标点击+`el.click()` 兜底 |
 | GUI 版本红框 | 🟡 待确认 | 我加了 git-hash 版本框；用户曾提及自己也加了版本显示，**可能重复**，需查 |
 
-**结论**：搜索模式大方向已通，最后一个已知变种（隐藏 `<a>` 占位链接）已在代码层修复，但**需要重启脚本用 `5b940b6` 跑一轮真实验证**。
+**结论**：推荐 feed 100% 正常（22:52 那轮 5 赞 5 评 0 错，证明登录/点击/评论全链路 OK）。
+搜索模式是**纯粹的前端点击定位问题**，与登录/反爬无关。最新 commit 已修复「杀伤 @click」的自伤逻辑，
+**需要重启脚本用最新代码跑一轮关键词搜索**（如 `claude`）做端到端验证。若仍 404，取
+`debug_search_card_*.html`（现已导出完整卡片结构）看 `@click` 真实挂载点。
 
 ---
 
