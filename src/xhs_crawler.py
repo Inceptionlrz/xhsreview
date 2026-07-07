@@ -193,9 +193,14 @@ class XhsCrawler:
         self._note_urls: Dict[str, str] = {}
 
         # 搜索模式标记：上次抓取是否来自关键词搜索
-        # 搜索结果的笔记需要通过「点击卡片」方式打开（而非直接 goto URL），
-        # 因为搜索结果卡片的 URL 不含有效 xsec_token，直接导航会被 404/扫码拦截
+        # 搜索结果的卡片 href 内通常不含有效 xsec_token（token 由前端在点击瞬间注入），
+        # 直接 goto 或硬点击都会 404。解决方案：从搜索结果页内嵌的
+        # window.__INITIAL_STATE__ 提取每个笔记真实的 xsec_token，构造带 token 的完整 URL，
+        # 搜索模式即可复用与推荐模式一致的 goto 逻辑（先 xsec_source=search，失败再试 note）。
         self._last_fetch_was_search: bool = False
+
+        # note_id → 从搜索结果页 __INITIAL_STATE__ 提取的真实 xsec_token
+        self._search_tokens: Dict[str, str] = {}
 
     # ---------------- 日志 ----------------
     def _log(self, level: str, msg: str):
@@ -766,6 +771,112 @@ class XhsCrawler:
         except Exception:
             return False
 
+    def _is_404(self, page) -> bool:
+        """判断当前是否落到了 XHS 的 404/扫码拦截中转页"""
+        try:
+            url = page.url
+            if "/404" in url:
+                return True
+            # XHS 反爬中转页 URL 形如 /404?source=/404/sec_xxx?redirectPath=...
+            if "source=" in url and "redirectPath=" in url:
+                return True
+            # 页面正文出现拦截文案也算
+            txt = self._safe_text(page, "body")
+            if "当前笔记暂时无法浏览" in txt or "该笔记不存在或已删除" in txt:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _navigate_to_note(self, page: Page, note_id: str) -> bool:
+        """统一导航到笔记详情页（搜索 / 普通 feed 共用）
+
+        搜索模式：用从 __INITIAL_STATE__ 提取的真实 xsec_token 构造 URL，
+        优先 xsec_source=search，失败再试 note 来源；都不行才兜底点击卡片。
+        普通模式：直接用缓存的带 token 完整 URL goto。
+        返回 True 表示成功落到非 404 页。
+        """
+        url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
+        tok = self._search_tokens.get(note_id)
+
+        if self._last_fetch_was_search and tok:
+            search_url = self._build_search_detail_url(note_id, tok)
+            note_url = self._build_note_detail_url(note_id, tok)
+            for try_url in (search_url, note_url, url):
+                self._navigate_with_retry(page, try_url)
+                time.sleep(random.uniform(1.5, 2.5))
+                if not self._is_404(page):
+                    return True
+                self._log("warn", f"  [search] token 导航 404，尝试下一来源: {try_url[:64]}")
+            # 所有 token 来源 404 → 兜底点击卡片（SPA 路由）
+            if self._is_search_page(page):
+                self._click_note_card_on_search(page, note_id)
+                time.sleep(random.uniform(2.0, 3.5))
+            return not self._is_404(page)
+        elif self._last_fetch_was_search:
+            # 搜索模式但没拿到 token：点击卡片兜底，失败再 goto
+            if self._is_search_page(page):
+                self._click_note_card_on_search(page, note_id)
+                time.sleep(random.uniform(2.0, 3.5))
+            else:
+                self._navigate_with_retry(page, url)
+                time.sleep(random.uniform(1.2, 2.0))
+            return not self._is_404(page)
+        else:
+            # 普通 feed 模式：直接导航（URL 含 xsec_token）
+            self._navigate_with_retry(page, url)
+            time.sleep(random.uniform(1.2, 2.0))
+            return not self._is_404(page)
+
+    def _extract_search_note_tokens(self, page: Page) -> Dict[str, str]:
+        """从搜索结果页内嵌的 window.__INITIAL_STATE__ 提取 note_id -> xsec_token 映射
+
+        XHS 搜索结果卡片的 href 通常不含有效 xsec_token（token 由前端点击时注入），
+        但页面 JSON 状态里保存了每个笔记的真实 token。递归扫描该结构即可拿到。
+        返回 {note_id: xsec_token}。
+        """
+        try:
+            data = page.evaluate("""() => {
+                function findTokens(obj, out) {
+                    if (!obj || typeof obj !== 'object') return out;
+                    if (Array.isArray(obj)) {
+                        for (var i = 0; i < obj.length; i++) findTokens(obj[i], out);
+                        return out;
+                    }
+                    var tok = obj.xsecToken || obj.xsec_token || obj.xsecSource;
+                    var nid = obj.id || obj.noteId || (obj.note && (obj.note.id));
+                    if (tok && nid && typeof nid === 'string' && typeof tok === 'string') {
+                        out[nid] = tok;
+                    }
+                    for (var k in obj) {
+                        if (Object.prototype.hasOwnProperty.call(obj, k)) {
+                            findTokens(obj[k], out);
+                        }
+                    }
+                    return out;
+                }
+                try {
+                    return findTokens(window.__INITIAL_STATE__ || {}, {});
+                } catch (e) { return {}; }
+            }""")
+            return data or {}
+        except Exception:
+            return {}
+
+    def _build_search_detail_url(self, note_id: str, token: str) -> str:
+        """用搜索来源 token 构造详情页 URL（优先 search，备用 note 来源）"""
+        return (
+            f"https://www.xiaohongshu.com/explore/{note_id}"
+            f"?xsec_token={token}&xsec_source=search"
+        )
+
+    def _build_note_detail_url(self, note_id: str, token: str) -> str:
+        """用 note 来源 token 构造详情页 URL（推荐 feed 同款格式）"""
+        return (
+            f"https://www.xiaohongshu.com/explore/{note_id}"
+            f"?xsec_token={token}&xsec_source=note"
+        )
+
     def _do_fetch_feed(self, page: Page, scroll_times: int,
                        category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
         try:
@@ -775,7 +886,21 @@ class XhsCrawler:
                 self._last_fetch_was_search = True
                 self._navigate_with_retry(page, url)
                 time.sleep(random.uniform(1.5, 2.5))
-                return self._extract_feed_cards(page, max_items=20)
+                posts = self._extract_feed_cards(page, max_items=20)
+                # 提取搜索结果每个笔记的真实 xsec_token，构造带 token 的完整 URL
+                # （搜索卡片 href 不含有效 token，直接 goto 会 404，必须用它）
+                tokens = self._extract_search_note_tokens(page)
+                if tokens:
+                    self._search_tokens.update(tokens)
+                    for p in posts:
+                        nid = p.get("note_id", "")
+                        tok = tokens.get(nid)
+                        if tok and nid:
+                            self._note_urls[nid] = self._build_search_detail_url(nid, tok)
+                    self._log("info", f"  提取到 {len(tokens)} 个搜索笔记 token")
+                else:
+                    self._log("warn", "  未能从搜索页提取 xsec_token（详情可能 404）")
+                return posts
 
             self._last_fetch_was_search = False
 
@@ -834,52 +959,15 @@ class XhsCrawler:
 
     def _do_open_note(self, page: Page, note_id: str, fallback_title: str = "") -> Optional[Dict[str, Any]]:
         try:
-            # ── 策略选择：搜索结果 vs 普通 feed ──
-            # 搜索结果的卡片 URL 缺少有效 xsec_token，直接 page.goto() 会触发
-            # 404 中转 → "当前笔记暂时无法浏览" 扫码拦截。
-            # 因此搜索模式必须通过「在搜索结果页上真实点击卡片」进入详情，
-            # 这与真人行为一致，能保留正确的 session 上下文。
-            url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-
-            if self._last_fetch_was_search and self._is_search_page(page):
-                # 搜索模式：在当前搜索结果页上找到匹配的卡片并点击进入
-                clicked = self._click_note_card_on_search(page, note_id)
-                if clicked:
-                    time.sleep(random.uniform(2.0, 3.5))
-                    self._log("info", f"  [search-click] 已点击搜索结果卡片: {note_id[:12]}...")
-                else:
-                    # 点击失败 → 回退到直接导航（可能仍被拦截）
-                    self._log("warn", f"  [search-click] 未找到卡片 {note_id[:12]}，回退 URL 导航")
-                    self._navigate_with_retry(page, url)
-                    time.sleep(random.uniform(1.2, 2.0))
-            else:
-                # 普通 feed 模式：直接导航（URL 含 xsec_token）
-                self._navigate_with_retry(page, url)
-                time.sleep(random.uniform(1.2, 2.0))
+            # 统一导航：搜索模式用提取到的真实 xsec_token 构造 URL（优先 search 来源，
+            # 失败再试 note 来源），普通 feed 直接用缓存的带 token 完整 URL。
+            self._navigate_to_note(page, note_id)
 
             # 检查是否落到了 404 / 登录拦截页
             current = page.url
-            if "/404" in current or "source=" in current.split("?")[-1].split("&")[0:1]:
+            if self._is_404(page):
                 self._log("warn", f"详情页命中 404 重定向: {current[:80]}")
-                # 二次尝试：如果还在搜索页附近，尝试重新点击或刷新搜索
-                if self._last_fetch_was_search:
-                    self._log("info", "  尝试返回搜索页重新点击...")
-                    # 回到搜索页
-                    kw = (urlparse(current).query or "")
-                    # 尝试用 JS history.back 再找卡片（更轻量）
-                    try:
-                        page.go_back(wait_until="domcontentloaded", timeout=8000)
-                        time.sleep(1.5)
-                        if self._is_search_page(page):
-                            clicked2 = self._click_note_card_on_search(page, note_id)
-                            if clicked2:
-                                time.sleep(random.uniform(2.0, 3.5))
-                            else:
-                                self._navigate_with_retry(page, url)
-                                time.sleep(1.5)
-                    except Exception:
-                        self._navigate_with_retry(page, url)
-                        time.sleep(1.5)
+                self._debug_dump(page, note_id, "search_404_debug")
 
             body_text = self._safe_text(page, ".title, body")
             if "当前笔记暂时无法浏览" in body_text or "暂时无法浏览" in body_text or "登录后查看" in body_text:
@@ -973,18 +1061,9 @@ class XhsCrawler:
         if not logged_in:
             return False
         try:
-            url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            # 搜索模式：优先尝试从搜索结果页点击进入
-            if self._last_fetch_was_search and self._is_search_page(page):
-                clicked = self._click_note_card_on_search(page, note_id)
-                if clicked:
-                    time.sleep(random.uniform(1.5, 2.5))
-                else:
-                    self._navigate_with_retry(page, url)
-                    time.sleep(random.uniform(1.0, 1.8))
-            else:
-                self._navigate_with_retry(page, url)
-                time.sleep(random.uniform(1.0, 1.8))
+            # 统一导航（搜索模式用 token URL，普通模式用缓存 URL）
+            self._navigate_to_note(page, note_id)
+            time.sleep(random.uniform(0.6, 1.2))
 
             # 检查是否被拦截
             body_text = self._safe_text(page, "body")
@@ -1032,17 +1111,9 @@ class XhsCrawler:
             text = text[:500]
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            # 搜索模式：优先从搜索结果页点击进入（避免 404 拦截）
-            if self._last_fetch_was_search and self._is_search_page(page):
-                clicked = self._click_note_card_on_search(page, note_id)
-                if clicked:
-                    time.sleep(random.uniform(2.0, 3.5))
-                else:
-                    self._navigate_with_retry(page, url)
-                    time.sleep(random.uniform(2.0, 3.0))
-            else:
-                self._navigate_with_retry(page, url)
-                time.sleep(random.uniform(2.0, 3.0))
+            # 统一导航：搜索模式用提取到的真实 xsec_token 构造 URL，避免 404 拦截
+            self._navigate_to_note(page, note_id)
+            time.sleep(random.uniform(2.0, 3.0))
 
             # ── 0. 确认当前在详情页（而非用户主页等）──
             current_url = page.url
