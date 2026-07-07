@@ -1,0 +1,190 @@
+"""
+Anthropic Messages API 客户端
+支持自定义 URL 和 API Key，标准 Anthropic Messages 协议
+"""
+
+import json
+import time
+import threading
+import requests
+from typing import Optional, Dict, Any, Generator
+
+
+class AnthropicClient:
+    """Anthropic Messages API 客户端"""
+
+    def __init__(self, base_url: str, api_key: str, model: str = "claude-3-5-sonnet-20241022",
+                 timeout: int = 60, max_retries: int = 3, proxy: str = ""):
+        self.base_url = (base_url or "https://api.anthropic.com").rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.proxy = proxy  # 格式: "127.0.0.1:7897" 或 ""
+        self._lock = threading.Lock()
+        self.last_error: Optional[str] = None
+        self.total_calls = 0
+        self.total_tokens_in = 0
+        self.total_tokens_out = 0
+
+    def update(self, base_url: str = None, api_key: str = None, model: str = None, proxy: str = None):
+        if base_url is not None:
+            self.base_url = base_url.rstrip("/")
+        if api_key is not None:
+            self.api_key = api_key
+        if model is not None:
+            self.model = model
+        if proxy is not None:
+            self.proxy = proxy
+
+    def _headers(self) -> Dict[str, str]:
+        # 同时发送 x-api-key（Anthropic 官方）和 Authorization: Bearer（中转站/OpenAI 兼容）
+        # 官方 API 忽略 Authorization 头，中转站忽略 x-api-key 头，两者兼容
+        return {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key or "",
+            "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
+            "anthropic-version": "2023-06-01",
+            "anthropic-dangerous-direct-browser-access": "true",  # 兼容中转
+        }
+
+    def _endpoint(self) -> str:
+        # 兼容各种 URL 格式：
+        #   https://api.anthropic.com          -> /v1/messages
+        #   https://relay.com/v1               -> /messages
+        #   https://relay.com/v1/messages      -> 原样使用
+        #   https://relay.com/messages         -> 原样使用
+        url = self.base_url
+        if url.endswith("/messages"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/messages"
+        if url.endswith("/v1/messages"):
+            return url
+        return f"{url}/v1/messages"
+
+    def _proxies(self) -> Optional[Dict[str, str]]:
+        """返回 requests proxies 参数"""
+        if not self.proxy:
+            return None
+        p = self.proxy.strip()
+        if not p:
+            return None
+        if not p.startswith("http"):
+            p = f"http://{p}"
+        return {"http": p, "https": p}
+
+    def test_connection(self) -> tuple[bool, str]:
+        """发送最小请求测试连通性"""
+        if not self.api_key:
+            return False, "API Key 为空"
+        payload = {
+            "model": self.model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        try:
+            r = requests.post(
+                self._endpoint(),
+                headers=self._headers(),
+                json=payload,
+                timeout=min(self.timeout, 20),
+                proxies=self._proxies(),
+            )
+            if r.status_code == 200:
+                return True, "连接成功"
+            # 智能错误诊断
+            body = r.text[:300]
+            hint = ""
+            if r.status_code == 401:
+                # 判断是官方还是中转站
+                if '"type":"error"' in body or '"authentication_error"' in body:
+                    hint = "\n\n【诊断】Anthropic 官方 API 拒绝了 Key，请检查 Key 是否正确（以 sk-ant- 开头）。"
+                else:
+                    hint = ("\n\n【诊断】检测到中转站/代理服务。已自动发送 Authorization: Bearer + x-api-key 双头认证。\n"
+                            "如果仍然 401，请检查：\n"
+                            "1. Key 是否正确（中转站 Key 通常不以 sk-ant- 开头）\n"
+                            "2. API URL 是否正确（中转站地址通常不是 api.anthropic.com）\n"
+                            "3. 账户余额/额度是否充足")
+            elif r.status_code == 404:
+                hint = "\n\n【诊断】端点路径不存在。请检查 API URL 是否正确，代码会自动拼接 /v1/messages。"
+            elif r.status_code == 429:
+                hint = "\n\n【诊断】请求频率超限，Key 本身有效，稍后重试即可。"
+            return False, f"HTTP {r.status_code}: {body}{hint}"
+        except Exception as e:
+            return False, f"连接失败: {e}"
+
+    def generate_reply(self, post_title: str, post_content: str,
+                       persona: str = "友好、有趣的小红书用户",
+                       max_tokens: int = 256,
+                       temperature: float = 0.85) -> Optional[str]:
+        """根据帖子内容生成回复"""
+        with self._lock:
+            self.total_calls += 1
+
+        system_prompt = (
+            f"你是一个{persona}。你会针对小红书上的帖子给出自然、口语化、"
+            f"真实感强的短回复。\n"
+            f"要求：\n"
+            f"1. 长度 1-2 句话，最多 60 字；\n"
+            f"2. 符合小红书风格（可适度使用 emoji 但不要太多）；\n"
+            f"3. 不要重复原帖内容；\n"
+            f"4. 不要说自己是 AI；\n"
+            f"5. 直接输出回复内容，不要任何前缀或解释。"
+        )
+        user_prompt = (
+            f"【帖子标题】{post_title or '(无标题)'}\n"
+            f"【帖子正文】{post_content or '(无正文)'}\n\n"
+            f"请针对这个帖子写一条回复："
+        )
+        payload = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                r = requests.post(
+                    self._endpoint(),
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self.timeout,
+                    proxies=self._proxies(),
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    # Anthropic Messages 格式: content[].text
+                    contents = data.get("content", [])
+                    text_parts = []
+                    for c in contents:
+                        if c.get("type") == "text":
+                            text_parts.append(c.get("text", ""))
+                    text = "".join(text_parts).strip()
+                    usage = data.get("usage", {})
+                    self.total_tokens_in += usage.get("input_tokens", 0)
+                    self.total_tokens_out += usage.get("output_tokens", 0)
+                    self.last_error = None
+                    return text
+                else:
+                    self.last_error = f"HTTP {r.status_code}: {r.text[:200]}"
+                    if r.status_code in (401, 403):
+                        return None  # 鉴权问题不重试
+                    time.sleep(1.0 * (attempt + 1))
+            except requests.exceptions.Timeout:
+                self.last_error = "请求超时"
+                time.sleep(1.5)
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"
+                time.sleep(1.0 * (attempt + 1))
+        return None
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "calls": self.total_calls,
+            "tokens_in": self.total_tokens_in,
+            "tokens_out": self.total_tokens_out,
+            "last_error": self.last_error,
+        }

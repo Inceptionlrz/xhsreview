@@ -1,0 +1,24 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== Secrets / local config (contains real API key!) =====
+config/
+
+# ===== Runtime artifacts =====
+logs/
+*.png
+*.html
+!config.example.json
+
+# ===== Tooling / memory =====
+.workbuddy/
+
+# ===== OS =====
+Thumbs.db
+.DS_Store
+
+# ===== Temp browser profile =====
+*_profile/
