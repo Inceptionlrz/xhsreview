@@ -154,27 +154,6 @@ class App:
                                        fg=COLORS["fg_warn"], font=FONTS["normal"])
         self.lbl_user_state.pack(side="right")
 
-        # ============== 升级进度 ==============
-        prog_frame = tk.LabelFrame(self.root, text="  升级进度追踪  ", bg=COLORS["bg_panel"],
-                                   fg=COLORS["fg_section"], font=FONTS["section"],
-                                   bd=1, relief="flat", highlightbackground=COLORS["border"],
-                                   highlightthickness=1)
-        prog_frame.pack(fill="x", padx=SIZE["pad"], pady=4)
-        prog_inner = tk.Frame(prog_frame, bg=COLORS["bg_section"])
-        prog_inner.pack(fill="both", expand=True, padx=8, pady=6)
-        # 进度条
-        self.progress = ttk.Progressbar(prog_inner, orient="horizontal", mode="determinate",
-                                        value=0, maximum=100)
-        self.progress.pack(fill="x", pady=(2, 6))
-        info_row = tk.Frame(prog_inner, bg=COLORS["bg_section"])
-        info_row.pack(fill="x")
-        self.lbl_prog_text = tk.Label(info_row, text="0 / 100  ·  距离下一级还需 100 经验",
-                                      bg=COLORS["bg_section"], fg=COLORS["fg_sub"], font=FONTS["small"])
-        self.lbl_prog_text.pack(side="left")
-        self.lbl_prog_eta = tk.Label(info_row, text="预计剩余：--",
-                                     bg=COLORS["bg_section"], fg=COLORS["fg_sub"], font=FONTS["small"])
-        self.lbl_prog_eta.pack(side="right")
-
         # ============== 运行模式 ==============
         mode_frame = tk.LabelFrame(self.root, text="  运行模式  ", bg=COLORS["bg_panel"],
                                    fg=COLORS["fg_section"], font=FONTS["section"],
@@ -484,14 +463,6 @@ class App:
             self.stat_labels["liked"].config(text=str(state.get("liked", 0)))
             self.stat_labels["replied"].config(text=str(state.get("replied", 0)))
             self.stat_labels["errors"].config(text=str(state.get("errors", 0)))
-            # 升级进度模拟：每爬 1 个帖子 +1，最多 100
-            seen = state.get("posts_seen", 0)
-            exp = min(seen, 100)
-            self.progress["value"] = exp
-            self.lbl_prog_text.config(text=f"{exp} / 100  ·  距离下一级还需 {100 - exp} 经验")
-            if state.get("posts_seen", 0) > 0:
-                eta = max(1, int((100 - exp) / max(1, seen) * 60))
-                self.lbl_prog_eta.config(text=f"预计剩余：{eta} 条")
         self.root.after(0, apply)
 
     def _on_mode_change(self):

@@ -21,6 +21,7 @@ import subprocess
 import socket
 import queue as _queue
 import urllib.request
+from urllib.parse import urlparse
 from typing import Optional, Dict, List, Any, Callable, Tuple
 
 # Playwright 可选导入
@@ -190,6 +191,11 @@ class XhsCrawler:
         # note_id → 完整 URL（含 xsec_token 等查询参数）的缓存
         # 在 _parse_card 中填充，在 _do_open_note/_do_like/_do_post_comment 中使用
         self._note_urls: Dict[str, str] = {}
+
+        # 搜索模式标记：上次抓取是否来自关键词搜索
+        # 搜索结果的笔记需要通过「点击卡片」方式打开（而非直接 goto URL），
+        # 因为搜索结果卡片的 URL 不含有效 xsec_token，直接导航会被 404/扫码拦截
+        self._last_fetch_was_search: bool = False
 
     # ---------------- 日志 ----------------
     def _log(self, level: str, msg: str):
@@ -751,15 +757,27 @@ class XhsCrawler:
                 time.sleep(0.5)
         raise last_err
 
+
+def _is_search_page(page) -> bool:
+    """判断当前页面是否为小红书搜索结果页"""
+    try:
+        url = page.url
+        return "search_result" in url or "search/" in url
+    except Exception:
+        return False
+
     def _do_fetch_feed(self, page: Page, scroll_times: int,
                        category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
         try:
             if keyword:
                 url = self.SEARCH_URL_TPL.format(kw=keyword)
                 self._log("info", f"按关键词搜索: {keyword}")
+                self._last_fetch_was_search = True
                 self._navigate_with_retry(page, url)
                 time.sleep(random.uniform(1.5, 2.5))
                 return self._extract_feed_cards(page, max_items=20)
+
+            self._last_fetch_was_search = False
 
             if category and category in self.CATEGORY_CHANNELS:
                 ch = self.CATEGORY_CHANNELS[category]
@@ -816,15 +834,56 @@ class XhsCrawler:
 
     def _do_open_note(self, page: Page, note_id: str, fallback_title: str = "") -> Optional[Dict[str, Any]]:
         try:
-            # 优先使用带 xsec_token 的完整 URL
+            # ── 策略选择：搜索结果 vs 普通 feed ──
+            # 搜索结果的卡片 URL 缺少有效 xsec_token，直接 page.goto() 会触发
+            # 404 中转 → "当前笔记暂时无法浏览" 扫码拦截。
+            # 因此搜索模式必须通过「在搜索结果页上真实点击卡片」进入详情，
+            # 这与真人行为一致，能保留正确的 session 上下文。
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            self._navigate_with_retry(page, url)
-            time.sleep(random.uniform(1.2, 2.0))
+
+            if self._last_fetch_was_search and _is_search_page(page):
+                # 搜索模式：在当前搜索结果页上找到匹配的卡片并点击进入
+                clicked = self._click_note_card_on_search(page, note_id)
+                if clicked:
+                    time.sleep(random.uniform(2.0, 3.5))
+                    self._log("info", f"  [search-click] 已点击搜索结果卡片: {note_id[:12]}...")
+                else:
+                    # 点击失败 → 回退到直接导航（可能仍被拦截）
+                    self._log("warn", f"  [search-click] 未找到卡片 {note_id[:12]}，回退 URL 导航")
+                    self._navigate_with_retry(page, url)
+                    time.sleep(random.uniform(1.2, 2.0))
+            else:
+                # 普通 feed 模式：直接导航（URL 含 xsec_token）
+                self._navigate_with_retry(page, url)
+                time.sleep(random.uniform(1.2, 2.0))
+
+            # 检查是否落到了 404 / 登录拦截页
+            current = page.url
+            if "/404" in current or "source=" in current.split("?")[-1].split("&")[0:1]:
+                self._log("warn", f"详情页命中 404 重定向: {current[:80]}")
+                # 二次尝试：如果还在搜索页附近，尝试重新点击或刷新搜索
+                if self._last_fetch_was_search:
+                    self._log("info", "  尝试返回搜索页重新点击...")
+                    # 回到搜索页
+                    kw = (urlparse(current).query or "")
+                    # 尝试用 JS history.back 再找卡片（更轻量）
+                    try:
+                        page.go_back(wait_until="domcontentloaded", timeout=8000)
+                        time.sleep(1.5)
+                        if _is_search_page(page):
+                            clicked2 = self._click_note_card_on_search(page, note_id)
+                            if clicked2:
+                                time.sleep(random.uniform(2.0, 3.5))
+                            else:
+                                self._navigate_with_retry(page, url)
+                                time.sleep(1.5)
+                    except Exception:
+                        self._navigate_with_retry(page, url)
+                        time.sleep(1.5)
 
             body_text = self._safe_text(page, ".title, body")
             if "当前笔记暂时无法浏览" in body_text or "暂时无法浏览" in body_text or "登录后查看" in body_text:
                 self._log("warn", f"详情页被拦截（未登录）: {note_id}")
-                # 更新登录状态，避免后续帖子白白尝试
                 with self._logged_in_lock:
                     self._logged_in = False
                 return {
@@ -847,11 +906,66 @@ class XhsCrawler:
                 "title": title,
                 "content": content,
                 "user": user,
-                "url": url,
+                "url": page.url,
             }
         except Exception as e:
             self._log("err", f"打开详情失败 {note_id}: {e}")
             return None
+
+    def _click_note_card_on_search(self, page: Page, note_id: str) -> bool:
+        """在搜索结果页上查找并点击包含指定 note_id 的卡片
+
+        搜索结果页上通常有多个 section.note-item / a.cover 元素，
+        其中 href 包含目标 note_id。找到后用真实鼠标 click 进入详情。
+        """
+        try:
+            # 策略 A：精确匹配 href 含 note_id 的链接元素
+            cards = page.query_selector_all("section.note-item a, a.cover, section.note-item, [class*='note-item'] a, [class*='card'] a")
+            for card in cards:
+                try:
+                    href = card.get_attribute("href") or ""
+                    if note_id in href:
+                        card.click(timeout=5000)
+                        self._log("info", f"    点击了匹配卡片 (href含{note_id[:12]})")
+                        return True
+                except Exception:
+                    continue
+
+            # 策略 B：JS 全局搜索任何 href 含 note_id 的可点击元素
+            clicked = page.evaluate(f"""() => {{
+                var nid = '{note_id}';
+                var links = document.querySelectorAll('a[href*="' + nid + '"], [data-note-id="' + nid + '"]');
+                for (var i = 0; i < links.length; i++) {{
+                    try {{ links[i].click(); return true; }} catch(e) {{}}
+                }}
+                // 更宽泛：所有包含 note_id 文本的链接
+                var allLinks = document.querySelectorAll('a');
+                for (var j = 0; j < allLinks.length; j++) {{
+                    var h = allLinks[j].getAttribute('href') || '';
+                    if (h.indexOf(nid) >= 0) {{
+                        try {{ allLinks[j].click(); return true; }} catch(e) {{}}
+                    }}
+                }}
+                return false;
+            }}""")
+            if clicked:
+                self._log("info", f"    JS 点击了含 {note_id[:12]} 的链接")
+                return True
+
+            # 策略 C：用 get_by_role + filter 定位
+            try:
+                locator = page.locator(f"a[href*='{note_id}']").first
+                if locator.count() > 0:
+                    locator.click(timeout=5000)
+                    self._log("info", f"    locator 点击了匹配卡片")
+                    return True
+            except Exception:
+                pass
+
+            return False
+        except Exception as e:
+            self._log("warn", f"    搜索页点击卡片失败: {e}")
+            return False
 
     def _do_like(self, page: Page, note_id: str) -> bool:
         with self._logged_in_lock:
@@ -860,8 +974,17 @@ class XhsCrawler:
             return False
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            self._navigate_with_retry(page, url)
-            time.sleep(random.uniform(1.0, 1.8))
+            # 搜索模式：优先尝试从搜索结果页点击进入
+            if self._last_fetch_was_search and _is_search_page(page):
+                clicked = self._click_note_card_on_search(page, note_id)
+                if clicked:
+                    time.sleep(random.uniform(1.5, 2.5))
+                else:
+                    self._navigate_with_retry(page, url)
+                    time.sleep(random.uniform(1.0, 1.8))
+            else:
+                self._navigate_with_retry(page, url)
+                time.sleep(random.uniform(1.0, 1.8))
 
             # 检查是否被拦截
             body_text = self._safe_text(page, "body")
@@ -909,8 +1032,17 @@ class XhsCrawler:
             text = text[:500]
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            self._navigate_with_retry(page, url)
-            time.sleep(random.uniform(2.0, 3.0))
+            # 搜索模式：优先从搜索结果页点击进入（避免 404 拦截）
+            if self._last_fetch_was_search and _is_search_page(page):
+                clicked = self._click_note_card_on_search(page, note_id)
+                if clicked:
+                    time.sleep(random.uniform(2.0, 3.5))
+                else:
+                    self._navigate_with_retry(page, url)
+                    time.sleep(random.uniform(2.0, 3.0))
+            else:
+                self._navigate_with_retry(page, url)
+                time.sleep(random.uniform(2.0, 3.0))
 
             # ── 0. 确认当前在详情页（而非用户主页等）──
             current_url = page.url

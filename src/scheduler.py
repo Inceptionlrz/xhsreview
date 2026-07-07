@@ -99,6 +99,7 @@ class Scheduler:
 
             self._log("ok", f"开始运行 | 模式={mode} | 板块={category or '全部'}"
                            f" | 关键词={keyword or '(无)'}")
+            self._log("info", "📊 统计追踪已启动：将记录点赞次数 / 评论次数")
             self._publish_state()
 
             batch_count = 0
@@ -168,7 +169,7 @@ class Scheduler:
                             and random.randint(1, 100) <= int(self.config.get("like_rate", 0))):
                         if self.crawler.like_note(note_id):
                             self._state["liked"] += 1
-                            self._log("ok", f"👍 点赞: {detail.get('title','')[:30]}")
+                            self._log("ok", f"👍 点赞({self._state['liked']}次): {detail.get('title','')[:30]}")
                             self._publish_state()
                         time.sleep(random.uniform(0.3, 0.8))
 
@@ -195,7 +196,7 @@ class Scheduler:
                             ok, msg = self.crawler.post_comment(note_id, reply)
                             if ok:
                                 self._state["replied"] += 1
-                                self._log("ok", f"💬 已回复: {reply[:60]}")
+                                self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
                             else:
                                 self._log("err", f"回复失败: {msg}")
                                 self._state["errors"] += 1
@@ -206,6 +207,12 @@ class Scheduler:
                 self._publish_state()
 
             self._log("ok", "本轮运行结束")
+            # ── 运行摘要统计 ──
+            s = self._state
+            self._log("ok",
+                f"📊 运行摘要 | 浏览{s['posts_seen']}帖 · 爬楼{s['posts_read']}条"
+                f" | 👍点赞{s['liked']}次 | 💬评论{self._state.get('replied', 0)}次"
+                f" | ❌错误{s['errors']}次")
         except Exception as e:
             self._log("err", f"调度异常: {e}")
             import traceback
