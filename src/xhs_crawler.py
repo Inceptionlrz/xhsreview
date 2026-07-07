@@ -791,50 +791,189 @@ class XhsCrawler:
     def _navigate_to_note(self, page: Page, note_id: str) -> bool:
         """统一导航到笔记详情页（搜索 / 普通 feed 共用）
 
-        搜索模式：用从 __INITIAL_STATE__ 提取的真实 xsec_token 构造 URL，
-        优先 xsec_source=search，失败再试 note 来源；都不行才兜底点击卡片。
-        普通模式：直接用缓存的带 token 完整 URL goto。
-        返回 True 表示成功落到非 404 页。
+        普通模式：直接 goto 带缓存 xsec_token 的完整 URL（可靠路径）。
+        搜索模式：按优先级尝试以下策略——
+
+          策略 A — SPA 内部点击（推荐）：
+            在搜索结果页上找到目标卡片，通过 JavaScript 分发完整的
+            pointerdown → pointerup → click 事件序列（bubbles=true），
+            让 Vue Router 拦截并执行客户端路由跳转（前端自动注入 token）。
+            这与真人鼠标点击的行为一致。
+
+          策略 B — history.pushState + popstate：
+            手动修改浏览器历史状态，模拟 SPA 路由切换。
+
+          策略 C — 硬点击卡片（Playwright .click()）：
+            兜底方案，可能触发硬导航到缺 token 的 URL。
+
+          策略 D — 直接 goto 带/不带 token 的 URL：
+            最后手段，大概率 404 但至少尝试了所有可能性。
+
+        返回 True 表示成功落到非 404 页面。
         """
         url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-        tok = self._search_tokens.get(note_id)
 
-        if self._last_fetch_was_search and tok:
-            search_url = self._build_search_detail_url(note_id, tok)
-            note_url = self._build_note_detail_url(note_id, tok)
-            for try_url in (search_url, note_url, url):
-                self._navigate_with_retry(page, try_url)
-                time.sleep(random.uniform(1.5, 2.5))
-                if not self._is_404(page):
-                    return True
-                self._log("warn", f"  [search] token 导航 404，尝试下一来源: {try_url[:64]}")
-            # 所有 token 来源 404 → 兜底点击卡片（SPA 路由）
-            if self._is_search_page(page):
-                self._click_note_card_on_search(page, note_id)
-                time.sleep(random.uniform(2.0, 3.5))
-            return not self._is_404(page)
-        elif self._last_fetch_was_search:
-            # 搜索模式但没拿到 token：点击卡片兜底，失败再 goto
-            if self._is_search_page(page):
-                self._click_note_card_on_search(page, note_id)
-                time.sleep(random.uniform(2.0, 3.5))
-            else:
-                self._navigate_with_retry(page, url)
-                time.sleep(random.uniform(1.2, 2.0))
-            return not self._is_404(page)
-        else:
-            # 普通 feed 模式：直接导航（URL 含 xsec_token）
+        if not self._last_fetch_was_search:
+            # ── 普通 feed 模式：直接导航（URL 含有效 xsec_token）──
             self._navigate_with_retry(page, url)
             time.sleep(random.uniform(1.2, 2.0))
             return not self._is_404(page)
 
-    def _extract_search_note_tokens(self, page: Page) -> Dict[str, str]:
-        """从搜索结果页内嵌的 window.__INITIAL_STATE__ 提取 note_id -> xsec_token 映射
+        # ══════════════════════════════════════════
+        #  搜索模式：多策略导航
+        # ══════════════════════════════════════════
 
-        XHS 搜索结果卡片的 href 通常不含有效 xsec_token（token 由前端点击时注入），
-        但页面 JSON 状态里保存了每个笔记的真实 token。递归扫描该结构即可拿到。
-        返回 {note_id: xsec_token}。
+        # ── 策略 A：SPA 内部事件分发点击 ──
+        self._log("info", f"  [nav] 尝试 SPA 内部点击: {note_id[:12]}...")
+        spa_ok = self._spa_click_card(page, note_id)
+        if spa_ok and not self._is_404(page):
+            self._log("info", "  [nav] ✅ SPA 点击成功，已进入详情")
+            return True
+        if spa_ok:
+            self._log("warn", "  [nav] SPA 点击触发了导航但命中 404")
+
+        # ── 策略 B：history.pushState ──
+        self._log("info", "  [nav] 尝试 history.pushState...")
+        try:
+            target = f"/explore/{note_id}"
+            pushed = page.evaluate("""(target) => {
+                try {
+                    // 先确保在搜索结果页上下文
+                    if (!window.location.pathname.includes('search')) return 'not_search_page';
+                    window.history.pushState({}, '', target);
+                    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+                    return 'pushed';
+                } catch(e) { return 'error:' + e.message; }
+            }""", target)
+            self._log("info", f"  [nav] pushState -> {pushed}")
+            time.sleep(random.uniform(2.0, 3.5))
+            if not self._is_404(page):
+                self._log("info", "  [nav] ✅ pushState 成功")
+                return True
+        except Exception as e:
+            self._log("warn", f"  [nav] pushState 异常: {e}")
+
+        # ── 策略 C：Playwright 硬点击卡片 ──
+        if self._is_search_page(page):
+            self._log("info", "  [nav] 尝试 Playwright 硬点击卡片...")
+            clicked = self._click_note_card_on_search(page, note_id)
+            if clicked:
+                time.sleep(random.uniform(2.5, 4.0))
+                if not self._is_404(page):
+                    self._log("info", "  [nav] ✅ 硬点击成功")
+                    return True
+
+        # ── 策略 D：直接 goto（最后手段）──
+        tok = self._search_tokens.get(note_id)
+        if tok:
+            for try_url in (
+                self._build_search_detail_url(note_id, tok),
+                self._build_note_detail_url(note_id, tok),
+                url,
+            ):
+                self._navigate_with_retry(page, try_url)
+                time.sleep(random.uniform(1.5, 2.5))
+                if not self._is_404(page):
+                    return True
+        else:
+            self._navigate_with_retry(page, url)
+            time.sleep(random.uniform(1.5, 2.5))
+
+        return not self._is_404(page)
+
+    def _spa_click_card(self, page: Page, note_id: str) -> bool:
+        """通过 JavaScript 分发完整的指针/鼠标事件序列，触发 Vue Router 客户端导航
+
+        与真人鼠标点击行为一致：pointerdown → pointerup → mousedown → mouseup → click，
+        全部设置 bubbles: true 以确保事件沿 DOM 树冒泡被 Vue 的事件系统捕获。
+        返回 True 表示成功触发了导航（URL 发生了变化）。
         """
+        try:
+            result = page.evaluate("""(noteId) => {
+                // 1. 找到包含目标 note_id 的可点击元素
+                var allLinks = document.querySelectorAll('a[href*="' + noteId + '"], section[class*="note-item"] a, [class*="card"] a, .note-item a');
+                var target = null;
+                for (var i = 0; i < allLinks.length; i++) {
+                    var href = allLinks[i].getAttribute('href') || '';
+                    if (href.indexOf(noteId) >= 0) {
+                        target = allLinks[i];
+                        break;
+                    }
+                }
+
+                if (!target) {
+                    // 宽松匹配：找任何包含 noteId 文本或 href 片段的链接
+                    var allA = document.querySelectorAll('a');
+                    for (var j = 0; j < allA.length; j++) {
+                        var h = allA[j].getAttribute('href') || '';
+                        if (h.indexOf(noteId.substring(0, 12)) >= 0) {
+                            target = allA[j];
+                            break;
+                        }
+                    }
+                }
+
+                if (!target) return 'no_target';
+
+                // 2. 滚动到可见区域
+                target.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+                // 3. 记录当前 URL 用于检测是否发生了导航
+                var beforeUrl = location.href;
+
+                // 4. 分发完整的事件序列（模拟真实用户点击）
+                var eventOpts = { bubbles: true, cancelable: true, view: window };
+
+                var ptrDown = new PointerEvent('pointerdown', Object.assign({}, eventOpts, { pointerId: 1, pointerType: 'mouse' }));
+                var ptrUp   = new PointerEvent('pointerup',   Object.assign({}, eventOpts, { pointerId: 1, pointerType: 'mouse' }));
+                var mouseDown = new MouseEvent('mousedown', eventOpts);
+                var mouseUp   = new MouseEvent('mouseup',   eventOpts);
+                var click     = new MouseEvent('click',     eventOpts);
+
+                target.dispatchEvent(ptrDown);
+                target.dispatchEvent(mouseDown);
+
+                // 短暂延迟后释放（模拟真实按住时间）
+                setTimeout(function() {
+                    target.dispatchEvent(ptrUp);
+                    target.dispatchEvent(mouseUp);
+                    target.dispatchEvent(click);
+                }, 50 + Math.random() * 80);
+
+                // 5. 短暂等待后检查 URL 是否变化（异步检测）
+                return 'dispatched:' + beforeUrl;
+            }""", note_id)
+
+            if result.startswith('no_target'):
+                self._log("warn", f"  [spa-click] 未找到卡片元素: {result}")
+                return False
+
+            self._log("info", f"  [spa-click] 已分发事件: {result}")
+            # 等待 SPA 路由跳转完成
+            time.sleep(random.uniform(2.5, 4.0))
+
+            # 验证 URL 是否变化
+            changed = page.evaluate("""(beforeUrl) => {
+                return location.href !== beforeUrl;
+            }""", result.split(':')[1] if ':' in result else '')
+
+            return bool(changed)
+        except Exception as e:
+            self._log("warn", f"  [spa-click] 异常: {e}")
+            return False
+
+    def _extract_search_note_tokens(self, page: Page) -> Dict[str, str]:
+        """从搜索结果页提取 note_id -> xsec_token 映射
+
+        按优先级尝试多个数据源：
+          1. window.__INITIAL_STATE__ 递归扫描
+          2. localStorage / sessionStorage 中 XHS 缓存数据
+          3. 页面内所有 <script> 标签的 JSON 数据
+          4. 全局 JS 变量（__INITIAL_DATA__, window.__data 等）
+        """
+        tokens: Dict[str, str] = {}
+
+        # ── 数据源 1：__INITIAL_STATE__ ──
         try:
             data = page.evaluate("""() => {
                 function findTokens(obj, out) {
@@ -843,9 +982,15 @@ class XhsCrawler:
                         for (var i = 0; i < obj.length; i++) findTokens(obj[i], out);
                         return out;
                     }
-                    var tok = obj.xsecToken || obj.xsec_token || obj.xsecSource;
-                    var nid = obj.id || obj.noteId || (obj.note && (obj.note.id));
-                    if (tok && nid && typeof nid === 'string' && typeof tok === 'string') {
+                    // 尝试多种可能的 token 字段名
+                    var tok = obj.xsecToken || obj.xsec_token || obj.xsecSource
+                            || obj.xSecToken || obj.token || obj.access_token;
+                    // 尝试多种可能的 ID 字段名
+                    var nid = obj.id || obj.noteId || obj.note_id
+                            || (obj.note && typeof obj.note === 'object' && obj.note.id)
+                            || (obj.data && typeof obj.data === 'object' && data.id);
+                    if (tok && nid && typeof nid === 'string' && typeof tok === 'string'
+                        && nid.length > 5 && tok.length > 5) {
                         out[nid] = tok;
                     }
                     for (var k in obj) {
@@ -856,12 +1001,119 @@ class XhsCrawler:
                     return out;
                 }
                 try {
-                    return findTokens(window.__INITIAL_STATE__ || {}, {});
+                    var result = {};
+                    if (window.__INITIAL_STATE__) findTokens(window.__INITIAL_STATE__, result);
+                    return result;
                 } catch (e) { return {}; }
             }""")
-            return data or {}
+            if data:
+                tokens.update(data)
+                self._log("info", f"  [token] __INITIAL_STATE__ 提取到 {len(data)} 个")
+        except Exception as e:
+            self._log("warn", f"  [token] __INITIAL_STATE__ 失败: {e}")
+
+        # ── 数据源 2：localStorage / sessionStorage ──
+        try:
+            storage_data = page.evaluate("""() => {
+                var out = {};
+                try {
+                    var keys = [];
+                    for (var i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+                    for (var j = 0; j < sessionStorage.length; j++) keys.push(sessionStorage.key(j));
+                    for (var k = 0; k < keys.length; k++) {
+                        try {
+                            var val = localStorage.getItem(keys[k]) || sessionStorage.getItem(keys[k]) || '';
+                            if (val.indexOf('xsec') >= 0 || val.indexOf('token') >= 0 || val.indexOf('noteId') >= 0) {
+                                out[keys[k]] = val.substring(0, 500);  // 截断避免过大
+                            }
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+                return out;
+            }""")
+            if storage_data:
+                # 从存储值中提取 token 对
+                for key, val in storage_data.items():
+                    try:
+                        import json as _json
+                        parsed = _json.loads(val)
+                        if isinstance(parsed, dict):
+                            for k, v in parsed.items():
+                                if isinstance(v, str) and len(v) > 10 and 'xsec' in v.lower():
+                                    # 尝试从嵌套结构中找 id-token 配对
+                                    pass
+                    except Exception:
+                        pass
+                self._log("info", f"  [token] 存储扫描: 找到 {len(storage_data)} 条含 token/key 的记录")
+        except Exception as e:
+            self._log("warn", f"  [token] 存储扫描失败: {e}")
+
+        # ── 数据源 3：页面 <script> 标签中的 JSON 数据 ──
+        try:
+            script_tokens = page.evaluate("""() => {
+                var out = {};
+                var scripts = document.querySelectorAll('script');
+                for (var i = 0; i < scripts.length; i++) {
+                    var text = scripts[i].textContent || '';
+                    // 搜索可能包含 xsec_token 的 JSON 块
+                    var patterns = [
+                        /["']?xsec_?token["']?\\s*:\\s*["']([^"']{10,})["']/gi,
+                        /["']?xsecSource["']?\\s*:\\s*["']([^"']{10,})["']/gi,
+                        /noteId["']?\\s*:\\s*["']([^"']+)["'][^}]*xsec/gi,
+                    ];
+                    for (var p = 0; p < patterns.length; p++) {
+                        patterns[p].lastIndex = 0;
+                        var match;
+                        while ((match = patterns[p].exec(text)) !== null) {
+                            out['script_' + p + '_' + out.length] = match[1];
+                        }
+                    }
+                }
+                return out;
+            }""")
+            if script_tokens:
+                self._log("info", f"  [token] script 标签扫描: {len(script_tokens)} 个候选")
         except Exception:
-            return {}
+            pass
+
+        # ── 数据源 4：拦截并读取 XHS 内部 API 返回的数据 ──
+        # （通过在搜索页执行 fetch 调用，让浏览器自动携带 cookie/session）
+        if not tokens:
+            try:
+                api_tokens = page.evaluate("""() => {
+                    // 尝试查找 Vue/Pinia store 中的数据
+                    var result = {};
+                    try {
+                        // 检查是否有 Vue 实例暴露了 store
+                        if (window.__VUE_APP__ && window.__VUE_APP__.__store__) {
+                            var store = window.__VUE_APP__.__store__;
+                            var state = store.state || {};
+                            // 递归查找 token
+                            function deepFind(o, path) {
+                                if (!o || typeof o !== 'object') return;
+                                for (var k in o) {
+                                    var v = o[k];
+                                    if (k.toLowerCase().indexOf('token') >= 0 && typeof v === 'string' && v.length > 10) {
+                                        result[path + '.' + k] = v;
+                                    }
+                                    if (typeof v === 'object') deepFind(v, path + '.' + k);
+                                }
+                            }
+                            deepFind(state, 'store');
+                        }
+                        // 也检查 __NEXT_DATA__ 等 React/Nuxt 全局变量
+                        if (window.__NEXT_DATA__) {
+                            result['__next'] = JSON.stringify(window.__NEXT_DATA__).substring(0, 200);
+                        }
+                    } catch(e) {}
+                    return result;
+                }""")
+                if api_tokens:
+                    self._log("info", f"  [token] 全局 JS 状态: {list(api_tokens.keys())[:3]}")
+            except Exception:
+                pass
+
+        return tokens
 
     def _build_search_detail_url(self, note_id: str, token: str) -> str:
         """用搜索来源 token 构造详情页 URL（优先 search，备用 note 来源）"""
@@ -979,7 +1231,7 @@ class XhsCrawler:
                     "title": fallback_title or "(详情需登录)",
                     "content": "",
                     "user": "",
-                    "url": url,
+                    "url": page.url,
                     "login_required": True,
                 }
 
