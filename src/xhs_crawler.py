@@ -1264,13 +1264,20 @@ class XhsCrawler:
             ts = int(time.time())
             path = _os.path.join(log_dir, f"debug_search_click_target_{note_id}_{ts}.html")
             html = page.evaluate("""(nid) => {
+                var meta = '';
+                var a = document.querySelector("a[href*='" + nid + "']");
+                if (a) {
+                    var s = getComputedStyle(a);
+                    meta += 'A_TAG=' + a.tagName + ' DISPLAY=' + s.display + ' VISIBILITY=' + s.visibility + ' HREF=' + (a.getAttribute('href')||'') + '\\n';
+                } else {
+                    meta += 'A_TAG=NOT_FOUND\\n';
+                }
                 var byId = document.querySelectorAll("[data-note-id='" + nid + "']");
-                if (byId.length) return byId[0].outerHTML;
-                var as = document.querySelectorAll("a[href*='" + nid + "']");
-                if (as.length) return as[0].outerHTML;
+                if (byId.length) return meta + byId[0].outerHTML;
+                if (a) return meta + a.outerHTML;
                 var ids = [];
                 document.querySelectorAll('[data-note-id]').forEach(function (e) { ids.push(e.getAttribute('data-note-id')); });
-                return 'TARGET_NOT_IN_DOM\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
+                return meta + 'TARGET_NOT_IN_DOM\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
             }""", note_id)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"<h3>Click-target snapshot for {note_id} (BEFORE click)</h3>\n")
@@ -1327,6 +1334,50 @@ class XhsCrawler:
         except Exception as e:
             self._log("warn", f"  [debug] 导出卡片 DOM 失败: {e}")
 
+    def _resolve_search_click_target(self, page: Page, note_id: str):
+        """解析搜索卡片的真实可点击元素（ElementHandle）。
+
+        小红书搜索卡片有两种结构：
+          1) 可见 <a href="/explore/{id}">（链接本身承载 @click）→ 直接点 <a>
+          2) display:none 的 SEO 占位 <a> + 父级卡片容器承载 @click
+             → 点隐藏 <a> 会触发其默认硬导航（8 字符假 token → 404），必须改点
+               其父级可见卡片容器（section.note-item / .cover 等）。
+
+        用 JS 在页面内判定 <a> 是否可见，可见则返回 <a>，否则上溯到首个可见且具
+        卡片语义的祖先容器；最后兜底返回 <a> 的可见父级。
+        """
+        try:
+            handle = page.evaluate_handle("""(nid) => {
+                const a = document.querySelector(`a[href*='${nid}']`);
+                if (!a) return null;
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                if (vis(a)) return a;                       // 情况1：<a> 可见直接点
+                let el = a.parentElement;
+                const re = /note-item|cover|card|feed-item|\\bnote\\b/i;
+                while (el && el !== document.body) {
+                    const cls = (typeof el.className === 'string') ? el.className : '';
+                    if (vis(el) && (re.test(cls) || el.tagName === 'SECTION' || el.tagName === 'ARTICLE')) {
+                        return el;                          // 情况2：上溯到可见卡片容器
+                    }
+                    el = el.parentElement;
+                }
+                // 兜底：<a> 的可见父级（哪怕不是 card 类）
+                let p = a.parentElement;
+                while (p && p !== document.body) { if (vis(p)) return p; p = p.parentElement; }
+                return a.parentElement || a;
+            }""", note_id)
+            if handle is None:
+                return None
+            return handle.as_element()
+        except Exception as e:
+            self._log("warn", f"    解析点击目标失败: {e}")
+            return None
+
     def _click_note_card_on_search(self, page: Page, note_id: str) -> bool:
         """在搜索结果页真实点击目标卡片，触发 Vue Router 客户端路由跳转进入详情。
 
@@ -1337,60 +1388,54 @@ class XhsCrawler:
         需在每次点击前先清除其 pointer-events 让真实事件穿透。每点一次都轮询详情。
         """
         try:
-            # 搜索页是虚拟滚动列表：先滚动定位，确保目标卡片已渲染进 DOM，
-            # 否则 query_selector_all 找不到元素 → 直接返回 False → 回退 token URL 撞 404
+            # 搜索页是虚拟滚动列表：先滚动定位，确保目标卡片已渲染进 DOM
             self._ensure_card_in_dom(page, note_id)
             # 点击前快照：导出目标卡片真实 DOM（点击前），用于定位为何 click 走硬导航
             self._dump_click_target(page, note_id)
 
-            # 候选定位（按优先级）：<a>链接 → data-note-id容器 → note-item区块
-            candidates = [
-                (f"a[href*='{note_id}']", "卡片链接"),
-                (f"[data-note-id='{note_id}']", "卡片容器"),
-                ("section.note-item, [class*='note-item']", "note-item区块"),
-            ]
-            for sel, label in candidates:
-                try:
-                    if "note-item" in sel:
-                        # 第三层：仅保留内部确实含 note_id 的区块
-                        items = page.query_selector_all(sel)
-                        els = []
-                        for it in items:
-                            try:
-                                if note_id in (it.inner_html() or ""):
-                                    els.append(it)
-                            except Exception:
-                                continue
-                    else:
-                        els = page.query_selector_all(sel)
-                except Exception as e:
-                    self._log("warn", f"    定位{label}失败: {e}")
-                    continue
+            # 智能解析点击目标（关键修复 2026-07-07）：
+            #   失败卡片特征 = 承载 note_id 的 <a> 是 display:none 的 SEO 占位链接，
+            #   真实 Vue @click（注入 40+ 真实 token）挂在它的【父级卡片容器】上。
+            #   直接点隐藏 <a> 会触发其默认硬导航（8 字符假 token → 404）。故：
+            #   <a> 可见则点 <a>；<a> 隐藏则上溯到最接近的可见卡片容器再点。
+            target = self._resolve_search_click_target(page, note_id)
+            if target is None:
+                self._log("warn", "    未能解析到任何点击目标（卡片可能未渲染/已下架）")
+                return False
 
-                for el in els:
+            try:
+                # 若目标是父级容器（隐藏 <a> 的 decoy 情况）：点击前禁用内部 <a> 的
+                # 指针事件，确保真实点击命中承载 @click 的封面/容器，而非触发 <a> 默认
+                # 硬导航（哪怕 XHS 滚动后把 <a> 渲染成可见，也会被 pointer-events 穿透）
+                if (target.get_attribute("tagName") or "").upper() != "A":
                     try:
-                        # 每次点击前都重清遮罩（XHS 遮罩可能动态重建）
-                        self._clear_search_masks(page)
-                        try:
-                            el.scroll_into_view_if_needed(timeout=2000)
-                        except Exception:
-                            pass
-                        # 普通点击：mask 已设 pointer-events:none，命中测试会穿透到 <a>
-                        try:
-                            el.click(timeout=4000)
-                        except Exception as e1:
-                            # 仍报拦截/不可见 → 二次清遮罩 + force 兜底
-                            self._clear_search_masks(page)
-                            self._log("warn", f"    普通点击{label}失败({e1})，force 重试")
-                            el.click(timeout=4000, force=True)
-                        self._log("info", f"    真实点击{label} (含{note_id[:10]})")
-                        if self._wait_for_detail(page, note_id, timeout=6.0):
-                            return True
-                        self._log("warn", "    点击后未进入详情（可能404），换下一候选")
-                    except Exception as e:
-                        self._log("warn", f"    点击{label}失败: {e}")
-                        continue
-
+                        page.evaluate("""(nid) => {
+                            document.querySelectorAll(`a[href*='${nid}']`).forEach(a => {
+                                a.style.pointerEvents = 'none';
+                            });
+                        }""", note_id)
+                    except Exception:
+                        pass
+                # 每次点击前都重清遮罩（XHS 遮罩可能动态重建，会拦截 pointer events）
+                self._clear_search_masks(page)
+                try:
+                    target.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                # 真实点击：Playwright 派发 trusted 事件 → 触发 Vue @click → router.push 带真实 token
+                try:
+                    target.click(timeout=4000)
+                except Exception as e1:
+                    # 仍报拦截/不可见 → 二次清遮罩 + force 兜底
+                    self._clear_search_masks(page)
+                    self._log("warn", f"    普通点击失败({e1})，force 重试")
+                    target.click(timeout=4000, force=True)
+                self._log("info", f"    真实点击卡片容器 (含{note_id[:10]})")
+                if self._wait_for_detail(page, note_id, timeout=6.0):
+                    return True
+                self._log("warn", "    点击后未进入详情（可能404）")
+            except Exception as e:
+                self._log("warn", f"    点击卡片失败: {e}")
             return False
         except Exception as e:
             self._log("warn", f"    搜索页点击卡片失败: {e}")

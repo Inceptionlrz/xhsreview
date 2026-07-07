@@ -4,6 +4,7 @@
 
 import os
 import time
+import subprocess
 import queue
 import threading
 import tkinter as tk
@@ -77,6 +78,32 @@ class App:
         self.root.geometry(f"{SIZE['win_w']}x{SIZE['win_h']}")
         self.root.minsize(820, 800)
 
+    def _get_version(self) -> str:
+        """读取当前 git 短哈希作为运行版本号（脏工作区追加 *）。"""
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            head = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=base,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8").strip()
+            dirty = subprocess.call(["git", "diff", "--quiet"], cwd=base) != 0
+            return f"{head}{'*' if dirty else ''}"
+        except Exception:
+            return "unknown"
+
+    def _build_version_badge(self, parent):
+        """左上角红色版本框：实时显示 git commit，排查时可与 git log 对齐。"""
+        try:
+            box = tk.Frame(parent, bg=COLORS["bg_panel"],
+                           highlightbackground="#E74C3C", highlightthickness=1, bd=0)
+            box.pack(side="left", padx=(0, 14))
+            ver = self._get_version()
+            self.lbl_version = tk.Label(box, text=f"版本 {ver}", bg=COLORS["bg_panel"],
+                                        fg="#E74C3C", font=FONTS["small"])
+            self.lbl_version.pack(padx=5, pady=1)
+        except Exception:
+            pass
+
     def _build_styles(self):
         s = ttk.Style()
         try:
@@ -135,6 +162,8 @@ class App:
         user_frame.pack(fill="x", padx=SIZE["pad"], pady=(SIZE["pad"], 4))
         user_inner = tk.Frame(user_frame, bg=COLORS["bg_panel"])
         user_inner.pack(fill="x", padx=8, pady=6)
+        # 左上角：版本红框（实时读取 git commit，便于排查运行版本）
+        self._build_version_badge(user_inner)
         tk.Label(user_inner, text="用户：", bg=COLORS["bg_panel"], fg=COLORS["fg_text"],
                  font=FONTS["normal"]).pack(side="left")
         self.lbl_username = tk.Label(user_inner, text="未登录", bg=COLORS["bg_panel"],
