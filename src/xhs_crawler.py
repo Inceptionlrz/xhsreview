@@ -758,13 +758,13 @@ class XhsCrawler:
         raise last_err
 
 
-def _is_search_page(page) -> bool:
-    """判断当前页面是否为小红书搜索结果页"""
-    try:
-        url = page.url
-        return "search_result" in url or "search/" in url
-    except Exception:
-        return False
+    def _is_search_page(self, page) -> bool:
+        """判断当前页面是否为小红书搜索结果页"""
+        try:
+            url = page.url
+            return "search_result" in url or "search/" in url
+        except Exception:
+            return False
 
     def _do_fetch_feed(self, page: Page, scroll_times: int,
                        category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
@@ -841,7 +841,7 @@ def _is_search_page(page) -> bool:
             # 这与真人行为一致，能保留正确的 session 上下文。
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
 
-            if self._last_fetch_was_search and _is_search_page(page):
+            if self._last_fetch_was_search and self._is_search_page(page):
                 # 搜索模式：在当前搜索结果页上找到匹配的卡片并点击进入
                 clicked = self._click_note_card_on_search(page, note_id)
                 if clicked:
@@ -870,7 +870,7 @@ def _is_search_page(page) -> bool:
                     try:
                         page.go_back(wait_until="domcontentloaded", timeout=8000)
                         time.sleep(1.5)
-                        if _is_search_page(page):
+                        if self._is_search_page(page):
                             clicked2 = self._click_note_card_on_search(page, note_id)
                             if clicked2:
                                 time.sleep(random.uniform(2.0, 3.5))
@@ -975,7 +975,7 @@ def _is_search_page(page) -> bool:
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
             # 搜索模式：优先尝试从搜索结果页点击进入
-            if self._last_fetch_was_search and _is_search_page(page):
+            if self._last_fetch_was_search and self._is_search_page(page):
                 clicked = self._click_note_card_on_search(page, note_id)
                 if clicked:
                     time.sleep(random.uniform(1.5, 2.5))
@@ -1033,7 +1033,7 @@ def _is_search_page(page) -> bool:
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
             # 搜索模式：优先从搜索结果页点击进入（避免 404 拦截）
-            if self._last_fetch_was_search and _is_search_page(page):
+            if self._last_fetch_was_search and self._is_search_page(page):
                 clicked = self._click_note_card_on_search(page, note_id)
                 if clicked:
                     time.sleep(random.uniform(2.0, 3.5))
