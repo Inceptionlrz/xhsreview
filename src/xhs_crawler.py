@@ -1228,6 +1228,58 @@ class XhsCrawler:
             self._log("warn", f"    滚动定位卡片失败: {e}")
             return False
 
+    def _wait_search_cards_rendered(self, page: Page, timeout: float = 12.0) -> int:
+        """等待搜索结果页卡片渲染完成，返回最终渲染的卡片数。
+
+        用于回搜索页 / dump 前：_navigate_with_retry 用 domcontentloaded 只等
+        DOM 加载，不等搜索结果接口返回，故刚回到搜索页时卡片区可能还是空白。
+        若不等渲染就 dump，会误判 CARD_NOT_FOUND（假阴性）。这里轮询 data-note-id
+        数量，连续两次一致即视为稳定。
+        """
+        try:
+            deadline = time.time() + timeout
+            last = -1
+            while time.time() < deadline:
+                n = int(page.evaluate("() => document.querySelectorAll('[data-note-id]').length") or 0)
+                if n > 0 and n == last:
+                    return n
+                last = n
+                time.sleep(0.5)
+            return int(page.evaluate("() => document.querySelectorAll('[data-note-id]').length") or 0)
+        except Exception:
+            return 0
+
+    def _dump_click_target(self, page: Page, note_id: str):
+        """点击前快照：导出目标卡片 outerHTML（点击之前），用于定位为何某些卡片
+        真实 click 走了 <a> 默认硬导航（8 字符假 token → 404）而非 Vue @click
+        （注入 40+ 真实 token → 进详情）。
+
+        相比点击失败后再 dump（此时页面可能已硬导航离开 / 卡片区空白），点击前
+        快照能拿到干净的卡片真实 DOM 结构，是定位点击目标的首选依据。
+        """
+        try:
+            import os as _os
+            log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "logs")
+            _os.makedirs(log_dir, exist_ok=True)
+            ts = int(time.time())
+            path = _os.path.join(log_dir, f"debug_search_click_target_{note_id}_{ts}.html")
+            html = page.evaluate("""(nid) => {
+                var byId = document.querySelectorAll("[data-note-id='" + nid + "']");
+                if (byId.length) return byId[0].outerHTML;
+                var as = document.querySelectorAll("a[href*='" + nid + "']");
+                if (as.length) return as[0].outerHTML;
+                var ids = [];
+                document.querySelectorAll('[data-note-id]').forEach(function (e) { ids.push(e.getAttribute('data-note-id')); });
+                return 'TARGET_NOT_IN_DOM\\n渲染中卡片数=' + ids.length + '\\n已渲染note_id样本=' + ids.slice(0, 30).join(',');
+            }""", note_id)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"<h3>Click-target snapshot for {note_id} (BEFORE click)</h3>\n")
+                f.write(f"<p>URL: {page.url}</p>\n")
+                f.write(f"<pre style='max-height:600px;overflow:auto'>{html}</pre>")
+            self._log("info", f"  [debug] 已导出点击前卡片快照: {path}")
+        except Exception as e:
+            self._log("warn", f"  [debug] 导出点击前快照失败: {e}")
+
     def _dump_search_card_dom(self, page: Page, note_id: str):
         """点击失败后导出搜索结果页中目标卡片的真实 DOM（outerHTML）。
 
@@ -1241,7 +1293,9 @@ class XhsCrawler:
             _os.makedirs(log_dir, exist_ok=True)
             ts = int(time.time())
             path = _os.path.join(log_dir, f"debug_search_card_{note_id}_{ts}.html")
-            # 先尽力滚动定位，让虚拟列表渲染该卡片
+            # 先等待搜索页卡片渲染完成（避免刚回搜索页时卡片区空白 → 假阴性）
+            self._wait_search_cards_rendered(page)
+            # 再滚动定位，让虚拟列表渲染目标卡片
             self._ensure_card_in_dom(page, note_id)
             html = page.evaluate("""(nid) => {
                 try {
@@ -1286,6 +1340,8 @@ class XhsCrawler:
             # 搜索页是虚拟滚动列表：先滚动定位，确保目标卡片已渲染进 DOM，
             # 否则 query_selector_all 找不到元素 → 直接返回 False → 回退 token URL 撞 404
             self._ensure_card_in_dom(page, note_id)
+            # 点击前快照：导出目标卡片真实 DOM（点击前），用于定位为何 click 走硬导航
+            self._dump_click_target(page, note_id)
 
             # 候选定位（按优先级）：<a>链接 → data-note-id容器 → note-item区块
             candidates = [
