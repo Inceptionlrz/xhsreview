@@ -193,13 +193,16 @@ class XhsCrawler:
         self._note_urls: Dict[str, str] = {}
 
         # 搜索模式标记：上次抓取是否来自关键词搜索
-        # 搜索结果的卡片 href 内通常不含有效 xsec_token（token 由前端在点击瞬间注入），
-        # 直接 goto 或硬点击都会 404。解决方案：从搜索结果页内嵌的
-        # window.__INITIAL_STATE__ 提取每个笔记真实的 xsec_token，构造带 token 的完整 URL，
-        # 搜索模式即可复用与推荐模式一致的 goto 逻辑（先 xsec_source=search，失败再试 note）。
+        # 搜索模式标记：上次抓取是否来自关键词搜索
+        # 搜索结果的卡片点击由 Vue Router 接管（处理器用数据里的真实 xsec_token
+        # 做 router.push），直接 goto 缺 token 的 URL 必 404。因此搜索模式必须
+        # 用真实鼠标点击卡片触发客户端路由跳转，而不能用 URL 直接导航。
         self._last_fetch_was_search: bool = False
+        # 上次搜索的关键词（处理多篇笔记时需回到搜索结果页再点下一张卡片）
+        self._last_search_keyword: str = ""
 
-        # note_id → 从搜索结果页 __INITIAL_STATE__ 提取的真实 xsec_token
+        # note_id → 从搜索结果页 __INITIAL_STATE__ 提取的真实 xsec_token（可能为空，
+        # 此时只能依赖真实点击进入详情）
         self._search_tokens: Dict[str, str] = {}
 
     # ---------------- 日志 ----------------
@@ -792,22 +795,15 @@ class XhsCrawler:
         """统一导航到笔记详情页（搜索 / 普通 feed 共用）
 
         普通模式：直接 goto 带缓存 xsec_token 的完整 URL（可靠路径）。
-        搜索模式：按优先级尝试以下策略——
 
-          策略 A — SPA 内部点击（推荐）：
-            在搜索结果页上找到目标卡片，通过 JavaScript 分发完整的
-            pointerdown → pointerup → click 事件序列（bubbles=true），
-            让 Vue Router 拦截并执行客户端路由跳转（前端自动注入 token）。
-            这与真人鼠标点击的行为一致。
+        搜索模式：XHS 搜索卡片由 Vue Router 接管——点击时处理器用数据里的真实
+        xsec_token 做 router.push()，而卡片 <a> 的 href 本身缺 token。因此
+        URL 直接跳转必 404，必须真实点击卡片触发客户端路由。导航采用：
 
-          策略 B — history.pushState + popstate：
-            手动修改浏览器历史状态，模拟 SPA 路由切换。
-
-          策略 C — 硬点击卡片（Playwright .click()）：
-            兜底方案，可能触发硬导航到缺 token 的 URL。
-
-          策略 D — 直接 goto 带/不带 token 的 URL：
-            最后手段，大概率 404 但至少尝试了所有可能性。
+          策略 1（首选）：真实鼠标点击卡片（trusted 事件 → 触发 Vue @click
+                   → router.push 带 token → 进入详情）。多篇笔记时若当前已
+                   离开搜索页，先回到搜索结果页再点下一张卡片。
+          策略 2（兜底）：用提取到的 xsec_token 构造 URL 直接 goto。
 
         返回 True 表示成功落到非 404 页面。
         """
@@ -820,50 +816,29 @@ class XhsCrawler:
             return not self._is_404(page)
 
         # ══════════════════════════════════════════
-        #  搜索模式：多策略导航
+        #  搜索模式：真实点击卡片（模仿真人）触发 Vue 路由
         # ══════════════════════════════════════════
 
-        # ── 策略 A：SPA 内部事件分发点击 ──
-        self._log("info", f"  [nav] 尝试 SPA 内部点击: {note_id[:12]}...")
-        spa_ok = self._spa_click_card(page, note_id)
-        if spa_ok and not self._is_404(page):
-            self._log("info", "  [nav] ✅ SPA 点击成功，已进入详情")
-            return True
-        if spa_ok:
-            self._log("warn", "  [nav] SPA 点击触发了导航但命中 404")
+        # 处理多篇笔记时，点完上一张后已处于详情页 → 需先回到搜索结果页
+        if not self._is_search_page(page):
+            self._log("info", f"  [nav] 当前不在搜索页，返回搜索结果: {self._last_search_keyword}")
+            try:
+                self._navigate_with_retry(
+                    page, self.SEARCH_URL_TPL.format(kw=self._last_search_keyword)
+                )
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception:
+                pass
 
-        # ── 策略 B：history.pushState ──
-        self._log("info", "  [nav] 尝试 history.pushState...")
-        try:
-            target = f"/explore/{note_id}"
-            pushed = page.evaluate("""(target) => {
-                try {
-                    // 先确保在搜索结果页上下文
-                    if (!window.location.pathname.includes('search')) return 'not_search_page';
-                    window.history.pushState({}, '', target);
-                    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
-                    return 'pushed';
-                } catch(e) { return 'error:' + e.message; }
-            }""", target)
-            self._log("info", f"  [nav] pushState -> {pushed}")
-            time.sleep(random.uniform(2.0, 3.5))
-            if not self._is_404(page):
-                self._log("info", "  [nav] ✅ pushState 成功")
-                return True
-        except Exception as e:
-            self._log("warn", f"  [nav] pushState 异常: {e}")
-
-        # ── 策略 C：Playwright 硬点击卡片 ──
+        # ── 策略 1：真实鼠标点击卡片（trusted 事件触发 Vue @click → router.push 带 token）──
         if self._is_search_page(page):
-            self._log("info", "  [nav] 尝试 Playwright 硬点击卡片...")
-            clicked = self._click_note_card_on_search(page, note_id)
-            if clicked:
-                time.sleep(random.uniform(2.5, 4.0))
-                if not self._is_404(page):
-                    self._log("info", "  [nav] ✅ 硬点击成功")
-                    return True
+            self._log("info", f"  [nav] 真实点击卡片进入详情: {note_id[:12]}...")
+            if self._click_note_card_on_search(page, note_id):
+                self._log("info", "  [nav] ✅ 真实点击成功，已进入详情")
+                return True
+            self._log("warn", "  [nav] 真实点击未进入详情，尝试 token URL 兜底")
 
-        # ── 策略 D：直接 goto（最后手段）──
+        # ── 策略 2：token URL 直接 goto（兜底，可能仍 404）──
         tok = self._search_tokens.get(note_id)
         if tok:
             for try_url in (
@@ -880,87 +855,6 @@ class XhsCrawler:
             time.sleep(random.uniform(1.5, 2.5))
 
         return not self._is_404(page)
-
-    def _spa_click_card(self, page: Page, note_id: str) -> bool:
-        """通过 JavaScript 分发完整的指针/鼠标事件序列，触发 Vue Router 客户端导航
-
-        与真人鼠标点击行为一致：pointerdown → pointerup → mousedown → mouseup → click，
-        全部设置 bubbles: true 以确保事件沿 DOM 树冒泡被 Vue 的事件系统捕获。
-        返回 True 表示成功触发了导航（URL 发生了变化）。
-        """
-        try:
-            result = page.evaluate("""(noteId) => {
-                // 1. 找到包含目标 note_id 的可点击元素
-                var allLinks = document.querySelectorAll('a[href*="' + noteId + '"], section[class*="note-item"] a, [class*="card"] a, .note-item a');
-                var target = null;
-                for (var i = 0; i < allLinks.length; i++) {
-                    var href = allLinks[i].getAttribute('href') || '';
-                    if (href.indexOf(noteId) >= 0) {
-                        target = allLinks[i];
-                        break;
-                    }
-                }
-
-                if (!target) {
-                    // 宽松匹配：找任何包含 noteId 文本或 href 片段的链接
-                    var allA = document.querySelectorAll('a');
-                    for (var j = 0; j < allA.length; j++) {
-                        var h = allA[j].getAttribute('href') || '';
-                        if (h.indexOf(noteId.substring(0, 12)) >= 0) {
-                            target = allA[j];
-                            break;
-                        }
-                    }
-                }
-
-                if (!target) return 'no_target';
-
-                // 2. 滚动到可见区域
-                target.scrollIntoView({ behavior: 'instant', block: 'center' });
-
-                // 3. 记录当前 URL 用于检测是否发生了导航
-                var beforeUrl = location.href;
-
-                // 4. 分发完整的事件序列（模拟真实用户点击）
-                var eventOpts = { bubbles: true, cancelable: true, view: window };
-
-                var ptrDown = new PointerEvent('pointerdown', Object.assign({}, eventOpts, { pointerId: 1, pointerType: 'mouse' }));
-                var ptrUp   = new PointerEvent('pointerup',   Object.assign({}, eventOpts, { pointerId: 1, pointerType: 'mouse' }));
-                var mouseDown = new MouseEvent('mousedown', eventOpts);
-                var mouseUp   = new MouseEvent('mouseup',   eventOpts);
-                var click     = new MouseEvent('click',     eventOpts);
-
-                target.dispatchEvent(ptrDown);
-                target.dispatchEvent(mouseDown);
-
-                // 短暂延迟后释放（模拟真实按住时间）
-                setTimeout(function() {
-                    target.dispatchEvent(ptrUp);
-                    target.dispatchEvent(mouseUp);
-                    target.dispatchEvent(click);
-                }, 50 + Math.random() * 80);
-
-                // 5. 短暂等待后检查 URL 是否变化（异步检测）
-                return 'dispatched:' + beforeUrl;
-            }""", note_id)
-
-            if result.startswith('no_target'):
-                self._log("warn", f"  [spa-click] 未找到卡片元素: {result}")
-                return False
-
-            self._log("info", f"  [spa-click] 已分发事件: {result}")
-            # 等待 SPA 路由跳转完成
-            time.sleep(random.uniform(2.5, 4.0))
-
-            # 验证 URL 是否变化
-            changed = page.evaluate("""(beforeUrl) => {
-                return location.href !== beforeUrl;
-            }""", result.split(':')[1] if ':' in result else '')
-
-            return bool(changed)
-        except Exception as e:
-            self._log("warn", f"  [spa-click] 异常: {e}")
-            return False
 
     def _extract_search_note_tokens(self, page: Page) -> Dict[str, str]:
         """从搜索结果页提取 note_id -> xsec_token 映射
@@ -1136,6 +1030,7 @@ class XhsCrawler:
                 url = self.SEARCH_URL_TPL.format(kw=keyword)
                 self._log("info", f"按关键词搜索: {keyword}")
                 self._last_fetch_was_search = True
+                self._last_search_keyword = keyword
                 self._navigate_with_retry(page, url)
                 time.sleep(random.uniform(1.5, 2.5))
                 posts = self._extract_feed_cards(page, max_items=20)
@@ -1253,58 +1148,77 @@ class XhsCrawler:
             return None
 
     def _click_note_card_on_search(self, page: Page, note_id: str) -> bool:
-        """在搜索结果页上查找并点击包含指定 note_id 的卡片
+        """在搜索结果页真实点击目标卡片，触发 Vue Router 客户端路由跳转进入详情。
 
-        搜索结果页上通常有多个 section.note-item / a.cover 元素，
-        其中 href 包含目标 note_id。找到后用真实鼠标 click 进入详情。
+        关键：必须让 Vue 的 @click 处理器接管（用数据里的真实 xsec_token 做
+        router.push），而非 <a> 默认硬导航（缺 token → 404）。Playwright 的
+        .click() 派发 trusted 事件，会触发 Vue 处理器。优先点卡片根容器
+        （承载 @click 的元素），失败再点 <a>；每点一次都轮询等待进入详情页。
         """
         try:
-            # 策略 A：精确匹配 href 含 note_id 的链接元素
-            cards = page.query_selector_all("section.note-item a, a.cover, section.note-item, [class*='note-item'] a, [class*='card'] a")
-            for card in cards:
+            # 1) 直接匹配含 note_id 的 <a> 链接（trusted 点击 → 触发 Vue @click → router.push）
+            links = page.query_selector_all(f"a[href*='{note_id}']")
+            for el in links:
                 try:
-                    href = card.get_attribute("href") or ""
-                    if note_id in href:
-                        card.click(timeout=5000)
-                        self._log("info", f"    点击了匹配卡片 (href含{note_id[:12]})")
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=4000)
+                    self._log("info", f"    真实点击卡片链接 (href含{note_id[:10]})")
+                    if self._wait_for_detail(page, note_id, timeout=6.0):
                         return True
-                except Exception:
+                    self._log("warn", "    点击链接后未进入详情（可能404），换下一候选")
+                except Exception as e:
+                    self._log("warn", f"    点击链接失败: {e}")
                     continue
 
-            # 策略 B：JS 全局搜索任何 href 含 note_id 的可点击元素
-            clicked = page.evaluate(f"""() => {{
-                var nid = '{note_id}';
-                var links = document.querySelectorAll('a[href*="' + nid + '"], [data-note-id="' + nid + '"]');
-                for (var i = 0; i < links.length; i++) {{
-                    try {{ links[i].click(); return true; }} catch(e) {{}}
-                }}
-                // 更宽泛：所有包含 note_id 文本的链接
-                var allLinks = document.querySelectorAll('a');
-                for (var j = 0; j < allLinks.length; j++) {{
-                    var h = allLinks[j].getAttribute('href') || '';
-                    if (h.indexOf(nid) >= 0) {{
-                        try {{ allLinks[j].click(); return true; }} catch(e) {{}}
-                    }}
-                }}
-                return false;
-            }}""")
-            if clicked:
-                self._log("info", f"    JS 点击了含 {note_id[:12]} 的链接")
-                return True
+            # 2) 退而求其次：承载 data-note-id 的卡片根容器
+            roots = page.query_selector_all(f"[data-note-id='{note_id}']")
+            for el in roots:
+                try:
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=4000)
+                    self._log("info", f"    真实点击卡片容器 (data-note-id={note_id[:10]})")
+                    if self._wait_for_detail(page, note_id, timeout=6.0):
+                        return True
+                except Exception as e:
+                    self._log("warn", f"    点击容器失败: {e}")
+                    continue
 
-            # 策略 C：用 get_by_role + filter 定位
-            try:
-                locator = page.locator(f"a[href*='{note_id}']").first
-                if locator.count() > 0:
-                    locator.click(timeout=5000)
-                    self._log("info", f"    locator 点击了匹配卡片")
-                    return True
-            except Exception:
-                pass
+            # 3) 再退：遍历 note-item 区块，找内部确实含 note_id 的那个并点击
+            items = page.query_selector_all("section.note-item, [class*='note-item']")
+            for el in items:
+                try:
+                    inner = el.inner_html() or ""
+                    if note_id not in inner:
+                        continue
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=4000)
+                    self._log("info", "    真实点击匹配到的 note-item 卡片")
+                    if self._wait_for_detail(page, note_id, timeout=6.0):
+                        return True
+                except Exception as e:
+                    self._log("warn", f"    点击 note-item 失败: {e}")
+                    continue
 
             return False
         except Exception as e:
             self._log("warn", f"    搜索页点击卡片失败: {e}")
+            return False
+
+    def _wait_for_detail(self, page: Page, note_id: str, timeout: float = 6.0) -> bool:
+        """轮询等待 SPA 路由跳转完成：URL 变为 /explore/{note_id} 且非 404 页"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self._is_404(page):
+                    return False
+                if f"/explore/{note_id}" in page.url:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.4)
+        try:
+            return f"/explore/{note_id}" in page.url and not self._is_404(page)
+        except Exception:
             return False
 
     def _do_like(self, page: Page, note_id: str) -> bool:
@@ -1313,9 +1227,10 @@ class XhsCrawler:
         if not logged_in:
             return False
         try:
-            # 统一导航（搜索模式用 token URL，普通模式用缓存 URL）
-            self._navigate_to_note(page, note_id)
-            time.sleep(random.uniform(0.6, 1.2))
+            # 若已在目标详情页则跳过导航（避免无谓回搜索页再点回，减少 404 风险）
+            if not (f"/explore/{note_id}" in page.url and not self._is_404(page)):
+                self._navigate_to_note(page, note_id)
+                time.sleep(random.uniform(0.6, 1.2))
 
             # 检查是否被拦截
             body_text = self._safe_text(page, "body")
@@ -1363,9 +1278,10 @@ class XhsCrawler:
             text = text[:500]
         try:
             url = self._note_urls.get(note_id, f"https://www.xiaohongshu.com/explore/{note_id}")
-            # 统一导航：搜索模式用提取到的真实 xsec_token 构造 URL，避免 404 拦截
-            self._navigate_to_note(page, note_id)
-            time.sleep(random.uniform(2.0, 3.0))
+            # 若已在目标详情页则跳过导航（避免无谓往返 + 404 风险）
+            if not (f"/explore/{note_id}" in page.url and not self._is_404(page)):
+                self._navigate_to_note(page, note_id)
+                time.sleep(random.uniform(2.0, 3.0))
 
             # ── 0. 确认当前在详情页（而非用户主页等）──
             current_url = page.url
