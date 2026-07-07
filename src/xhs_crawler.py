@@ -836,6 +836,18 @@ class XhsCrawler:
             if self._click_note_card_on_search(page, note_id):
                 self._log("info", "  [nav] ✅ 真实点击成功，已进入详情")
                 return True
+            # 点击失败：可能因该卡片点击触发 <a> 默认硬导航（假 token → 404）。
+            # 回到搜索页导出该卡片真实 DOM，定位 @click 处理器挂载点以便精准修复。
+            if not self._is_search_page(page):
+                try:
+                    self._navigate_with_retry(
+                        page, self.SEARCH_URL_TPL.format(kw=self._last_search_keyword)
+                    )
+                    time.sleep(random.uniform(1.5, 2.5))
+                except Exception:
+                    pass
+            if self._is_search_page(page):
+                self._dump_search_card_dom(page, note_id)
             self._log("warn", "  [nav] 真实点击未进入详情，尝试 token URL 兜底")
 
         # ── 策略 2：token URL 直接 goto（兜底，可能仍 404）──
@@ -1165,6 +1177,46 @@ class XhsCrawler:
             }""")
         except Exception:
             pass
+
+    def _dump_search_card_dom(self, page: Page, note_id: str):
+        """点击失败后导出搜索结果页中目标卡片的真实 DOM（outerHTML）。
+
+        用于定位为什么某些卡片的真实点击会触发 <a> 默认硬导航（带 8 字符假
+        token → 404）而非 Vue @click 处理器（注入真实 token）。对比成功卡片的
+        DOM 即可定位点击处理器挂载的元素 / 遮罩层差异，从而精准修复选择器。
+        """
+        try:
+            import os as _os
+            log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "logs")
+            _os.makedirs(log_dir, exist_ok=True)
+            ts = int(time.time())
+            path = _os.path.join(log_dir, f"debug_search_card_{note_id}_{ts}.html")
+            html = page.evaluate("""(nid) => {
+                try {
+                    // 优先按 data-note-id 定位卡片根元素
+                    var byId = document.querySelectorAll('[data-note-id]');
+                    for (var i = 0; i < byId.length; i++) {
+                        if (byId[i].getAttribute('data-note-id') === nid) {
+                            return byId[i].outerHTML;
+                        }
+                    }
+                    // 退而求其次：含 note_id 的 <a>
+                    var as = document.querySelectorAll('a');
+                    for (var j = 0; j < as.length; j++) {
+                        if ((as[j].getAttribute('href') || '').indexOf(nid) >= 0) {
+                            return as[j].outerHTML;
+                        }
+                    }
+                    return 'CARD_NOT_FOUND_ON_PAGE';
+                } catch (e) { return 'ERR:' + e.message; }
+            }""", note_id)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"<h3>Search card DOM for {note_id}</h3>\n")
+                f.write(f"<p>URL: {page.url}</p>\n")
+                f.write(f"<pre style='max-height:600px;overflow:auto'>{html}</pre>")
+            self._log("info", f"  [debug] 已导出搜索卡片 DOM: {path}")
+        except Exception as e:
+            self._log("warn", f"  [debug] 导出卡片 DOM 失败: {e}")
 
     def _click_note_card_on_search(self, page: Page, note_id: str) -> bool:
         """在搜索结果页真实点击目标卡片，触发 Vue Router 客户端路由跳转进入详情。
