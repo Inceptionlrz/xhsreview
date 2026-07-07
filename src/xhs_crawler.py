@@ -1147,57 +1147,82 @@ class XhsCrawler:
             self._log("err", f"打开详情失败 {note_id}: {e}")
             return None
 
+    def _clear_search_masks(self, page: Page):
+        """清除搜索卡片上的 .note-detail-mask 等遮罩层对点击的拦截。
+
+        部分卡片（尤其视频类笔记）上盖了一层 .note-detail-mask 覆盖在 <a> 之上，
+        会拦截 pointer events，导致点击落不到 <a> 的 Vue @click → 无法触发
+        router.push → 回退到 token URL 兜底撞 404。该遮罩只是视觉层（hover 时
+        显示播放/展开按钮），设 pointer-events:none 让真实点击穿透到 <a> 即可，
+        不影响页面其它功能。遮罩可能随 Vue 重渲染动态重建，故每次点击前都重清。
+        """
+        try:
+            page.evaluate("""() => {
+                const sels = ['.note-detail-mask', '[class*="mask"]', '[class*="Mask"]'];
+                sels.forEach(s => {
+                    document.querySelectorAll(s).forEach(el => { el.style.pointerEvents = 'none'; });
+                });
+            }""")
+        except Exception:
+            pass
+
     def _click_note_card_on_search(self, page: Page, note_id: str) -> bool:
         """在搜索结果页真实点击目标卡片，触发 Vue Router 客户端路由跳转进入详情。
 
         关键：必须让 Vue 的 @click 处理器接管（用数据里的真实 xsec_token 做
         router.push），而非 <a> 默认硬导航（缺 token → 404）。Playwright 的
-        .click() 派发 trusted 事件，会触发 Vue 处理器。优先点卡片根容器
-        （承载 @click 的元素），失败再点 <a>；每点一次都轮询等待进入详情页。
+        .click() 派发 trusted 事件，会触发 Vue 处理器。优先点承载 @click 的
+        <a>/容器；⚠️ 部分卡片有 .note-detail-mask 遮罩覆盖在 <a> 之上拦截点击，
+        需在每次点击前先清除其 pointer-events 让真实事件穿透。每点一次都轮询详情。
         """
         try:
-            # 1) 直接匹配含 note_id 的 <a> 链接（trusted 点击 → 触发 Vue @click → router.push）
-            links = page.query_selector_all(f"a[href*='{note_id}']")
-            for el in links:
+            # 候选定位（按优先级）：<a>链接 → data-note-id容器 → note-item区块
+            candidates = [
+                (f"a[href*='{note_id}']", "卡片链接"),
+                (f"[data-note-id='{note_id}']", "卡片容器"),
+                ("section.note-item, [class*='note-item']", "note-item区块"),
+            ]
+            for sel, label in candidates:
                 try:
-                    el.scroll_into_view_if_needed()
-                    el.click(timeout=4000)
-                    self._log("info", f"    真实点击卡片链接 (href含{note_id[:10]})")
-                    if self._wait_for_detail(page, note_id, timeout=6.0):
-                        return True
-                    self._log("warn", "    点击链接后未进入详情（可能404），换下一候选")
+                    if "note-item" in sel:
+                        # 第三层：仅保留内部确实含 note_id 的区块
+                        items = page.query_selector_all(sel)
+                        els = []
+                        for it in items:
+                            try:
+                                if note_id in (it.inner_html() or ""):
+                                    els.append(it)
+                            except Exception:
+                                continue
+                    else:
+                        els = page.query_selector_all(sel)
                 except Exception as e:
-                    self._log("warn", f"    点击链接失败: {e}")
+                    self._log("warn", f"    定位{label}失败: {e}")
                     continue
 
-            # 2) 退而求其次：承载 data-note-id 的卡片根容器
-            roots = page.query_selector_all(f"[data-note-id='{note_id}']")
-            for el in roots:
-                try:
-                    el.scroll_into_view_if_needed()
-                    el.click(timeout=4000)
-                    self._log("info", f"    真实点击卡片容器 (data-note-id={note_id[:10]})")
-                    if self._wait_for_detail(page, note_id, timeout=6.0):
-                        return True
-                except Exception as e:
-                    self._log("warn", f"    点击容器失败: {e}")
-                    continue
-
-            # 3) 再退：遍历 note-item 区块，找内部确实含 note_id 的那个并点击
-            items = page.query_selector_all("section.note-item, [class*='note-item']")
-            for el in items:
-                try:
-                    inner = el.inner_html() or ""
-                    if note_id not in inner:
+                for el in els:
+                    try:
+                        # 每次点击前都重清遮罩（XHS 遮罩可能动态重建）
+                        self._clear_search_masks(page)
+                        try:
+                            el.scroll_into_view_if_needed(timeout=2000)
+                        except Exception:
+                            pass
+                        # 普通点击：mask 已设 pointer-events:none，命中测试会穿透到 <a>
+                        try:
+                            el.click(timeout=4000)
+                        except Exception as e1:
+                            # 仍报拦截/不可见 → 二次清遮罩 + force 兜底
+                            self._clear_search_masks(page)
+                            self._log("warn", f"    普通点击{label}失败({e1})，force 重试")
+                            el.click(timeout=4000, force=True)
+                        self._log("info", f"    真实点击{label} (含{note_id[:10]})")
+                        if self._wait_for_detail(page, note_id, timeout=6.0):
+                            return True
+                        self._log("warn", "    点击后未进入详情（可能404），换下一候选")
+                    except Exception as e:
+                        self._log("warn", f"    点击{label}失败: {e}")
                         continue
-                    el.scroll_into_view_if_needed()
-                    el.click(timeout=4000)
-                    self._log("info", "    真实点击匹配到的 note-item 卡片")
-                    if self._wait_for_detail(page, note_id, timeout=6.0):
-                        return True
-                except Exception as e:
-                    self._log("warn", f"    点击 note-item 失败: {e}")
-                    continue
 
             return False
         except Exception as e:
