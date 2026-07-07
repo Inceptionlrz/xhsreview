@@ -201,9 +201,11 @@ class XhsCrawler:
         # 上次搜索的关键词（处理多篇笔记时需回到搜索结果页再点下一张卡片）
         self._last_search_keyword: str = ""
 
-        # note_id → 从搜索结果页 __INITIAL_STATE__ 提取的真实 xsec_token（可能为空，
-        # 此时只能依赖真实点击进入详情）
+        # note_id → 从搜索结果卡片 DOM(a.cover) 提取的真实 xsec_token 与来源
+        # （参考 rednote-crawler：搜索卡片封面 <a class="cover"> 的 href 含真实 token，
+        #  隐藏 <a href="/explore/.."> 无 token。优先用此 token 直跳，缺失再回退真实点击）
         self._search_tokens: Dict[str, str] = {}
+        self._search_sources: Dict[str, str] = {}
 
     # ---------------- 日志 ----------------
     def _log(self, level: str, msg: str):
@@ -796,9 +798,10 @@ class XhsCrawler:
 
         普通模式：直接 goto 带缓存 xsec_token 的完整 URL（可靠路径）。
 
-        搜索模式：XHS 搜索卡片由 Vue Router 接管——点击时处理器用数据里的真实
-        xsec_token 做 router.push()，而卡片 <a> 的 href 本身缺 token。因此
-        URL 直接跳转必 404，必须真实点击卡片触发客户端路由。导航采用：
+        搜索模式：卡片真实 token 藏在封面 <a class="cover"> 的 href 里（隐藏
+        <a href="/explore/"> 无 token）。优先用该 token 直跳 /explore/{id}；
+        仅当提取不到 token 或直跳仍 404 时，才回退真实点击卡片触发 Vue 路由。
+        导航采用：
 
           策略 1（首选）：真实鼠标点击卡片（trusted 事件 → 触发 Vue @click
                    → router.push 带 token → 进入详情）。多篇笔记时若当前已
@@ -816,9 +819,27 @@ class XhsCrawler:
             return not self._is_404(page)
 
         # ══════════════════════════════════════════
-        #  搜索模式：真实点击卡片（模仿真人）触发 Vue 路由
+        #  搜索模式导航：优先用 a.cover 提取的 xsec_token 直接 goto；
+        #  缺 token 或 token 直跳仍 404 时，回退真实点击卡片触发 Vue 路由。
+        #  （参考 rednote-crawler：token 来自卡片封面链接，直跳即可进详情，
+        #    无需点击，规避遮罩/隐藏<a>/虚拟列表等点击类坑）
         # ══════════════════════════════════════════
 
+        # ── 策略 1（首选）：token URL 直接 goto ──
+        tok = self._search_tokens.get(note_id)
+        if tok:
+            for try_url in (
+                self._build_search_detail_url(note_id, tok),
+                self._build_note_detail_url(note_id, tok),
+            ):
+                self._navigate_with_retry(page, try_url)
+                time.sleep(random.uniform(1.2, 2.0))
+                if not self._is_404(page):
+                    self._log("info", "  [nav] ✅ token 直跳进入详情")
+                    return True
+            self._log("warn", "  [nav] token 直跳仍 404，回退真实点击")
+
+        # ── 策略 2（兜底）：真实鼠标点击卡片触发 Vue 路由 ──
         # 处理多篇笔记时，点完上一张后已处于详情页 → 需先回到搜索结果页
         if not self._is_search_page(page):
             self._log("info", f"  [nav] 当前不在搜索页，返回搜索结果: {self._last_search_keyword}")
@@ -830,14 +851,12 @@ class XhsCrawler:
             except Exception:
                 pass
 
-        # ── 策略 1：真实鼠标点击卡片（trusted 事件触发 Vue @click → router.push 带 token）──
         if self._is_search_page(page):
             self._log("info", f"  [nav] 真实点击卡片进入详情: {note_id[:12]}...")
             if self._click_note_card_on_search(page, note_id):
                 self._log("info", "  [nav] ✅ 真实点击成功，已进入详情")
                 return True
-            # 点击失败：可能因该卡片点击触发 <a> 默认硬导航（假 token → 404）。
-            # 回到搜索页导出该卡片真实 DOM，定位 @click 处理器挂载点以便精准修复。
+            # 点击失败：回到搜索页导出卡片真实 DOM，定位 @click 处理器挂载点
             if not self._is_search_page(page):
                 try:
                     self._navigate_with_retry(
@@ -848,30 +867,83 @@ class XhsCrawler:
                     pass
             if self._is_search_page(page):
                 self._dump_search_card_dom(page, note_id)
-            # 若真实点击已撞 404（<a> 默认硬导航，token 是占位假 token），
-            # token URL 兜底必仍 404，不再无谓重试，直接失败由上层优雅跳过
             if self._is_404(page):
-                self._log("warn", "  [nav] 真实点击已撞 404（硬导航），跳过 token URL 重试")
+                self._log("warn", "  [nav] 真实点击已撞 404（硬导航），跳过")
                 return False
-            self._log("warn", "  [nav] 真实点击未进入详情，尝试 token URL 兜底")
+            self._log("warn", "  [nav] 真实点击未进入详情，尝试兜底 URL")
 
-        # ── 策略 2：token URL 直接 goto（兜底，可能仍 404）──
-        tok = self._search_tokens.get(note_id)
-        if tok:
-            for try_url in (
-                self._build_search_detail_url(note_id, tok),
-                self._build_note_detail_url(note_id, tok),
-                url,
-            ):
-                self._navigate_with_retry(page, try_url)
-                time.sleep(random.uniform(1.5, 2.5))
-                if not self._is_404(page):
-                    return True
-        else:
+        # ── 兜底：无 token 时直跳（多半 404，但保持原行为）──
+        if not tok:
             self._navigate_with_retry(page, url)
             time.sleep(random.uniform(1.5, 2.5))
 
         return not self._is_404(page)
+
+    def _extract_search_tokens_from_cards(self, page: Page) -> Dict[str, str]:
+        """从搜索结果卡片 DOM 提取 note_id -> xsec_token（参考 rednote-crawler）。
+
+        搜索卡片含两类链接：
+          1) 隐藏 <a href="/explore/{id}">（无 token，直跳 404）
+          2) 封面 <a class="cover" href="/search_result/{id}?xsec_token=...&xsec_source=...">
+             —— 真实可用的 token 就在封面链接的 href 里。
+        策略：遍历卡片，从封面链接抠 xsec_token（及 xsec_source），映射 note_id。
+        命中即返回，比 __INITIAL_STATE__（搜索页无有效 token）可靠得多。
+        """
+        tokens: Dict[str, str] = {}
+        try:
+            cards = page.query_selector_all(
+                "section.note-item, [class*='note-item'], a.cover"
+            )
+            for card in cards:
+                # note_id：隐藏 /explore/ 链接 > 封面 search_result 路径 > 整卡 href
+                nid = None
+                exp = card.query_selector('a[href*="/explore/"]')
+                if exp:
+                    m = re.search(r"/explore/([a-f0-9]+)", exp.get_attribute("href") or "")
+                    if m:
+                        nid = m.group(1)
+                if not nid:
+                    m = re.search(r"/search_result/([a-f0-9]+)",
+                                   card.get_attribute("href") or "")
+                    if m:
+                        nid = m.group(1)
+                if not nid:
+                    m = re.search(r"/explore/([a-f0-9]+)",
+                                   card.get_attribute("href") or "")
+                    if m:
+                        nid = m.group(1)
+                if not nid:
+                    continue
+
+                # token + source：优先封面 a.cover，其次任意带 xsec_token 的链接
+                tok = None
+                src = "pc_search"
+                cover = card.query_selector("a.cover")
+                href_cover = cover.get_attribute("href") if cover else ""
+                if href_cover:
+                    m = re.search(r"xsec_token=([^&]+)", href_cover)
+                    if m:
+                        tok = m.group(1)
+                    m2 = re.search(r"xsec_source=([^&]+)", href_cover)
+                    if m2:
+                        src = m2.group(1)
+                if not tok:
+                    for lk in card.query_selector_all("a[href*='xsec_token']"):
+                        m = re.search(r"xsec_token=([^&]+)",
+                                      lk.get_attribute("href") or "")
+                        if m:
+                            tok = m.group(1)
+                            m2 = re.search(r"xsec_source=([^&]+)",
+                                          lk.get_attribute("href") or "")
+                            if m2:
+                                src = m2.group(1)
+                            break
+                if nid and tok:
+                    tokens[nid] = tok
+                    self._search_sources[nid] = src
+        except Exception as e:
+            self._log("warn", f"  [token] 卡片 DOM 提取失败: {e}")
+        return tokens
 
     def _extract_search_note_tokens(self, page: Page) -> Dict[str, str]:
         """从搜索结果页提取 note_id -> xsec_token 映射
@@ -883,6 +955,12 @@ class XhsCrawler:
           4. 全局 JS 变量（__INITIAL_DATA__, window.__data 等）
         """
         tokens: Dict[str, str] = {}
+
+        # ── 数据源 0（首选）：卡片 DOM 的 a.cover 链接（真实 token 所在）──
+        dom_tokens = self._extract_search_tokens_from_cards(page)
+        if dom_tokens:
+            tokens.update(dom_tokens)
+            self._log("info", f"  [token] 卡片 DOM(a.cover) 提取到 {len(dom_tokens)} 个")
 
         # ── 数据源 1：__INITIAL_STATE__ ──
         try:
@@ -1027,10 +1105,11 @@ class XhsCrawler:
         return tokens
 
     def _build_search_detail_url(self, note_id: str, token: str) -> str:
-        """用搜索来源 token 构造详情页 URL（优先 search，备用 note 来源）"""
+        """用搜索来源 token 构造详情页 URL（来源取自 a.cover href，缺省 pc_search）"""
+        src = getattr(self, "_search_sources", {}).get(note_id, "pc_search")
         return (
             f"https://www.xiaohongshu.com/explore/{note_id}"
-            f"?xsec_token={token}&xsec_source=search"
+            f"?xsec_token={token}&xsec_source={src}"
         )
 
     def _build_note_detail_url(self, note_id: str, token: str) -> str:
