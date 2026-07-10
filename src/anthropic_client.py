@@ -5,6 +5,7 @@ Anthropic Messages API 客户端
 
 import json
 import time
+import random
 import threading
 import requests
 from typing import Optional, Dict, Any, Generator
@@ -123,14 +124,15 @@ class AnthropicClient:
             self.total_calls += 1
 
         system_prompt = (
-            f"你是一个{persona}。你会针对小红书上的帖子给出自然、口语化、"
-            f"真实感强的短回复。\n"
-            f"要求：\n"
-            f"1. 长度 1-2 句话，最多 60 字；\n"
-            f"2. 符合小红书风格（可适度使用 emoji 但不要太多）；\n"
-            f"3. 不要重复原帖内容；\n"
-            f"4. 不要说自己是 AI；\n"
-            f"5. 直接输出回复内容，不要任何前缀或解释。"
+            f"你是一个{persona}。你会针对小红书上的帖子写一条像真人随手发的短回复。\n"
+            f"语气要求（非常重要）：\n"
+            f"1. 必须口语化、接地气，像随手刷到顺手评论，不要用书面语、不要用「首先/其次/总之」这类结构；\n"
+            f"2. 长度 1 句话为主，偶尔 2 句，多数在 10-40 字之间，不要太长太工整；\n"
+            f"3. 可以带点个人情绪（赞同/惊讶/共鸣/调侃/疑惑都行），但不要每句都热情洋溢；\n"
+            f"4. 允许偶尔用网络用语、缩写、语气词（如 哈哈、绝了、这也太、求链接），偶尔漏个标点或用个～也没事；\n"
+            f"5. 不要重复原帖内容，不要说教，更不要说自己是 AI 或助手；\n"
+            f"6. 偶尔（约两成）也可以只回一两个词或一个 emoji 表达情绪，不用硬凑句子；\n"
+            f"7. 直接输出回复内容，不要任何前缀、引号或解释。"
         )
         user_prompt = (
             f"【帖子标题】{post_title or '(无标题)'}\n"
@@ -180,6 +182,57 @@ class AnthropicClient:
                 self.last_error = f"{type(e).__name__}: {e}"
                 time.sleep(1.0 * (attempt + 1))
         return None
+
+    def humanize_reply(self, text: str, hz: Optional[Dict[str, Any]] = None) -> str:
+        """对 AI 生成的回复做内容层拟人后处理（防「AI 味」与人工审核）。
+
+        所有变换均不改变语义主体，只是让文本更像真人随手打的：
+          - 偶发轻微错别字（同音/形近，净效果不影响理解）
+          - 偶发追加 1 个随机 emoji
+          - 偶发只保留前半句（短评更真实）
+          - 偶发标点波动（去掉结尾句号 / 换成 ~ 或 ！）
+        hz 取不到对应旋钮时回退到安全默认值。
+        """
+        if not text or not text.strip():
+            return text
+        hz = hz or {}
+        try:
+            # 1) 偶发截断为短评（只留第一句 / 前 N 字）
+            if random.random() < float(hz.get("content_truncate_rate", 0.12)):
+                cut = text.split("。")[0].split("！")[0].split("?")[0].split("？")[0]
+                cut = cut.strip()
+                if len(cut) >= 4:
+                    text = cut
+
+            # 2) 偶发轻微错别字（同音/形近替换 1 处）
+            if random.random() < float(hz.get("content_typo_rate", 0.15)):
+                typo_map = [
+                    ("的", "地"), ("地", "的"), ("在", "再"), ("再", "在"),
+                    ("吧", "把"), ("吗", "嘛"), ("呢", "呐"), ("这", "这"),
+                    ("已", "以"), ("以", "已"), ("他", "她"), ("她", "他"),
+                ]
+                for a, b in typo_map:
+                    idx = text.find(a)
+                    if idx >= 0 and random.random() < 0.5:
+                        text = text[:idx] + b + text[idx + len(a):]
+                        break
+
+            # 3) 偶发追加 1 个随机 emoji
+            if random.random() < float(hz.get("content_emoji_rate", 0.50)):
+                emojis = ["😂", "✨", "🥺", "👍", "🔥", "💡", "🤔", "😭", "🌝", "🙈", "💯", "🥹"]
+                text = text.rstrip("。.!！?？~ ") + random.choice(emojis)
+
+            # 4) 偶发标点波动（去掉生硬结尾句号 / 换成 ~ 或 ！）
+            if random.random() < 0.35:
+                t = text.rstrip("。.!！?？~ ")
+                if random.random() < 0.5:
+                    text = t + "～"
+                else:
+                    text = t + "！"
+
+            return text.strip()
+        except Exception:
+            return text
 
     def stats(self) -> Dict[str, Any]:
         return {

@@ -34,6 +34,7 @@ class Scheduler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._processed_ids: set = set()
+        self._session_actions: int = 0  # 本次会话累计操作数（用于会话安全上限）
         self._state = {
             "running":    False,
             "started_at": 0.0,
@@ -163,45 +164,87 @@ class Scheduler:
                     else:
                         time.sleep(random.uniform(0.6, 1.4))
 
-                    # 点赞（需登录）
-                    if (self.config.get("auto_like")
-                            and self.crawler.is_logged_in
-                            and random.randint(1, 100) <= int(self.config.get("like_rate", 0))):
-                        if self.crawler.like_note(note_id):
-                            self._state["liked"] += 1
-                            self._log("ok", f"👍 点赞({self._state['liked']}次): {detail.get('title','')[:30]}")
-                            self._publish_state()
-                        time.sleep(random.uniform(0.3, 0.8))
+                    # ===== 拟人化 / 防封节奏 =====
+                    hz = self.config.get("humanize", {}) or {}
+                    if not isinstance(hz, dict):
+                        hz = {}
+                    hz_enabled = bool(hz.get("enabled", True))
 
-                    # AI 回复（需登录）
-                    if (self.config.get("auto_reply")
-                            and self.crawler.is_logged_in
-                            and random.randint(1, 100) <= int(self.config.get("reply_rate", 0))):
-                        title = detail.get("title", "")
-                        content = detail.get("content", "")
-                        if not (title or content):
-                            continue
-                        self._log("info", f"🧠 正在生成回复: {title[:30]}")
-                        reply = self.ai.generate_reply(
-                            post_title=title,
-                            post_content=content,
-                            persona=self.config.get("api_persona", "友好、有趣的小红书用户"),
-                            max_tokens=int(self.config.get("api_max_tokens", 256)),
-                            temperature=float(self.config.get("api_temperature", 0.85)),
-                        )
-                        if not reply:
-                            self._log("err", f"AI 生成失败: {self.ai.last_error or '未知'}")
-                            self._state["errors"] += 1
-                        else:
-                            ok, msg = self.crawler.post_comment(note_id, reply)
-                            if ok:
-                                self._state["replied"] += 1
-                                self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
-                            else:
-                                self._log("err", f"回复失败: {msg}")
+                    # 随机「纯浏览跳过」：并非每篇都操作，更像真人刷帖
+                    skip_rate = int(hz.get("skip_rate", 20)) if hz_enabled else 0
+                    if skip_rate > 0 and random.randint(1, 100) <= skip_rate:
+                        self._log("info", f"🙈 随机浏览跳过: {detail.get('title','')[:30]}（本次不操作）")
+                        self._maybe_wait()
+                        continue
+
+                    # 先按概率决定本帖要做的动作
+                    do_like = (self.config.get("auto_like")
+                               and self.crawler.is_logged_in
+                               and random.randint(1, 100) <= int(self.config.get("like_rate", 0)))
+                    do_reply = (self.config.get("auto_reply")
+                                and self.crawler.is_logged_in
+                                and random.randint(1, 100) <= int(self.config.get("reply_rate", 0)))
+                    actions = []
+                    if do_like:
+                        actions.append("like")
+                    if do_reply:
+                        actions.append("reply")
+                    if not actions:
+                        self._maybe_wait()
+                        continue
+
+                    # 操作顺序随机（真人不会每次都「先赞后评」）
+                    if hz_enabled and hz.get("randomize_order", True):
+                        random.shuffle(actions)
+
+                    for act in actions:
+                        if self._stop_event.is_set():
+                            break
+                        if act == "like":
+                            if self.crawler.like_note(note_id):
+                                self._state["liked"] += 1
+                                self._log("ok", f"👍 点赞({self._state['liked']}次): {detail.get('title','')[:30]}")
+                                self._publish_state()
+                                self._session_actions += 1
+                            time.sleep(random.uniform(0.3, 0.8))
+                        elif act == "reply":
+                            title = detail.get("title", "")
+                            content = detail.get("content", "")
+                            if not (title or content):
+                                continue
+                            # 偶发「看了但不评论」（更自然，且省一次 AI 调用）
+                            no_comment_rate = int(hz.get("no_comment_rate", 12)) if hz_enabled else 0
+                            if no_comment_rate > 0 and random.randint(1, 100) <= no_comment_rate:
+                                self._log("info", f"🙊 看了但没评论: {title[:30]}")
+                                continue
+                            self._log("info", f"🧠 正在生成回复: {title[:30]}")
+                            reply = self.ai.generate_reply(
+                                post_title=title,
+                                post_content=content,
+                                persona=self.config.get("api_persona", "友好、有趣的小红书用户"),
+                                max_tokens=int(self.config.get("api_max_tokens", 256)),
+                                temperature=float(self.config.get("api_temperature", 0.85)),
+                            )
+                            if not reply:
+                                self._log("err", f"AI 生成失败: {self.ai.last_error or '未知'}")
                                 self._state["errors"] += 1
-                            self._publish_state()
+                            else:
+                                # 内容层拟人后处理（防 AI 味 / 人工审核）
+                                reply = self.ai.humanize_reply(reply, hz if hz_enabled else {})
+                                ok, msg = self.crawler.post_comment(
+                                    note_id, reply, context_text=f"{title}\n{content}")
+                                if ok:
+                                    self._state["replied"] += 1
+                                    self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
+                                    self._session_actions += 1
+                                else:
+                                    self._log("err", f"回复失败: {msg}")
+                                    self._state["errors"] += 1
+                                self._publish_state()
 
+                    # 会话安全上限（累计操作达上限强制长休）& 偶发长休息
+                    self._maybe_session_break(hz, hz_enabled)
+                    self._maybe_long_break(hz, hz_enabled)
                     self._maybe_wait()
 
                 self._publish_state()
@@ -232,6 +275,37 @@ class Scheduler:
         end = time.time() + delay
         while time.time() < end and not self._stop_event.is_set():
             time.sleep(0.1)
+
+    def _sleep_with_stop(self, seconds: float):
+        """可被停止事件中断的睡眠（用于长休息，避免停止时卡死）"""
+        end = time.time() + seconds
+        while time.time() < end and not self._stop_event.is_set():
+            time.sleep(0.5)
+
+    def _maybe_long_break(self, hz: Dict[str, Any], enabled: bool):
+        """每帖处理后偶发「长休息」，打乱固定节奏。"""
+        if not enabled:
+            return
+        p = float(hz.get("long_break_prob", 0.07))
+        if p <= 0 or random.random() >= p:
+            return
+        dur = random.uniform(float(hz.get("long_break_min", 30)),
+                             float(hz.get("long_break_max", 120)))
+        self._log("warn", f"☕ 偶发长休息 {dur:.0f} 秒（拟人化节奏，避免规律化）")
+        self._sleep_with_stop(dur)
+
+    def _maybe_session_break(self, hz: Dict[str, Any], enabled: bool):
+        """累计操作达上限后强制长休并重置计数，规避频次异常风控。"""
+        if not enabled:
+            return
+        cap = int(hz.get("session_action_cap", 35))
+        if cap <= 0 or self._session_actions < cap:
+            return
+        dur = random.uniform(float(hz.get("session_break_min", 120)),
+                             float(hz.get("session_break_max", 300)))
+        self._log("warn", f"🌙 已达会话操作上限 {cap} 次，长休 {dur:.0f} 秒（防频次异常）")
+        self._session_actions = 0
+        self._sleep_with_stop(dur)
 
     # ---------------- 辅助 ----------------
     def _log(self, level: str, msg: str):

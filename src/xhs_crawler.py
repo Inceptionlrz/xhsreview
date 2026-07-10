@@ -102,6 +102,35 @@ MOCK_POSTS = [
 ]
 
 
+# ============== 拟人化默认参数（防封核心） ==============
+# 与 config.py 的 DEFAULT_CONFIG["humanize"] 保持一致；运行时用用户配置覆盖。
+HUMANIZE_DEFAULTS = {
+    "enabled":              True,
+    "type_min_delay":       0.06,
+    "type_max_delay":       0.20,
+    "type_pause_prob":      0.10,
+    "type_pause_min":       0.30,
+    "type_pause_max":       1.00,
+    "type_typo_rate":       0.05,
+    "read_enabled":         True,
+    "read_per_char":        0.010,
+    "read_min":             1.5,
+    "read_max":             5.0,
+    "scroll_human":         True,
+    "scroll_pause_prob":    0.30,
+    "scroll_back_prob":     0.25,
+    "mouse_human_move":     True,
+    "skip_rate":            20,
+    "long_break_prob":      0.07,
+    "long_break_min":       30,
+    "long_break_max":       120,
+    "session_action_cap":   35,
+    "session_break_min":    120,
+    "session_break_max":    300,
+    "randomize_order":      True,
+}
+
+
 def _autodetect_chrome() -> Optional[str]:
     """自动探测可用的 Chrome 可执行文件（兼容不同 playwright 版本）
 
@@ -136,9 +165,102 @@ def _autodetect_chrome() -> Optional[str]:
                     if os.path.exists(exe):
                         if best is None or name > best[0]:
                             best = (name, exe)
-        if best:
-            return best[1]
+    if best:
+        return best[1]
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 反自动化 / 反指纹 stealth 脚本（在每篇文档脚本执行前注入）
+# 覆盖：webdriver 标志、window.chrome 形态、plugins/mimeTypes、languages、
+#       设备内存兜底、WebGL 渲染器伪装（无 GPU 时 Playwright 必报 SwiftShader）。
+# 每项独立 try/catch，单点失败不影响其余补丁生效。
+# ─────────────────────────────────────────────────────────────────────────────
+_STEALTH_INIT_SCRIPT = r"""
+(function(){
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e){}
+
+  try {
+    var c = {
+      app: { isInstalled: false, InstallState: {}, RunningState: {} },
+      runtime: {
+        OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformOs: {},
+        PlatformArch: {}, RequestUpdateCheckStatus: {}, InstallReason: {},
+        ExtensionValidateErrorReasons: {},
+        connect: function(){ return {}; }, sendMessage: function(){}, getURL: function(){ return ''; }
+      },
+      csi: function(){ return { startE: 0, tran: 0, onloadT: 0, fid: 0 }; },
+      loadTimes: function(o){ if (o) { o.committedLoadTime = 0; o.startLoadTime = 0; } },
+      webstore: {}
+    };
+    try { Object.defineProperty(window, 'chrome', { get: function(){ return c; }, configurable: false }); }
+    catch(e) { window.chrome = c; }
+  } catch(e){}
+
+  try {
+    var origQ = window.navigator.permissions.query;
+    window.navigator.permissions.query = function(p){
+      if (p && p.name === 'notifications') return Promise.resolve({ state: Notification.permission });
+      return origQ(p);
+    };
+  } catch(e){}
+
+  try {
+    function MimeType(type, desc, suf){ this.type = type; this.description = desc; this.suffixes = suf || ''; }
+    function Plugin(name, desc, fn, mimes){
+      this.name = name; this.description = desc; this.filename = fn;
+      this.__mimes = mimes.map(function(m){ return new MimeType(m.type, m.desc, m.suf); });
+    }
+    Plugin.prototype.item = function(i){ return this.__mimes[i] || null; };
+    Plugin.prototype.namedItem = function(t){ return this.__mimes.find(function(m){ return m.type === t; }) || null; };
+    Object.defineProperty(Plugin.prototype, 'length', { get: function(){ return this.__mimes.length; } });
+
+    var defs = [
+      ['Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer',
+        [{ type: 'application/x-google-chrome-pdf', desc: 'Portable Document Format', suf: 'pdf' }]],
+      ['Chrome PDF Viewer', '', 'mhjfbmdgcfjbbpaeojklgmpfpjkcfgch',
+        [{ type: 'application/pdf', desc: 'Portable Document Format', suf: 'pdf' }]],
+      ['Native Client', '', 'ppapi',
+        [{ type: 'application/x-nacl', desc: '', suf: '' }, { type: 'application/x-pnacl', desc: '', suf: '' }]]
+    ];
+    var plugins = defs.map(function(d){ return new Plugin(d[0], d[1], d[2], d[3]); });
+    var arr = plugins.slice();
+    arr.item = function(i){ return plugins[i] || null; };
+    arr.namedItem = function(n){ return plugins.find(function(p){ return p.name === n; }) || null; };
+    arr.refresh = function(){};
+    Object.defineProperty(arr, 'length', { get: function(){ return plugins.length; } });
+
+    var mts = [];
+    plugins.forEach(function(p){ for (var i = 0; i < p.length; i++) mts.push(p.item(i)); });
+    var mtArr = mts.slice();
+    mtArr.item = function(i){ return mts[i] || null; };
+    mtArr.namedItem = function(t){ return mts.find(function(m){ return m.type === t; }) || null; };
+    Object.defineProperty(mtArr, 'length', { get: function(){ return mts.length; } });
+
+    Object.defineProperty(navigator, 'plugins', { get: function(){ return arr; }, configurable: true });
+    Object.defineProperty(navigator, 'mimeTypes', { get: function(){ return mtArr; }, configurable: true });
+  } catch(e){}
+
+  try { Object.defineProperty(navigator, 'languages', { get: function(){ return ['zh-CN', 'zh', 'en']; }, configurable: true }); } catch(e){}
+  try { if (navigator.deviceMemory === undefined) Object.defineProperty(navigator, 'deviceMemory', { get: function(){ return 8; }, configurable: true }); } catch(e){}
+
+  try {
+    function spoof(ctx){
+      var orig = ctx.prototype.getParameter;
+      ctx.prototype.getParameter = function(p){
+        var ext = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
+        if (ext) {
+          if (p === ext.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (NVIDIA)';
+          if (p === ext.UNMASKED_RENDERER_WEBGL) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        }
+        return orig.call(this, p);
+      };
+    }
+    if (window.WebGLRenderingContext) spoof(WebGLRenderingContext);
+    if (window.WebGL2RenderingContext) spoof(WebGL2RenderingContext);
+  } catch(e){}
+})();
+"""
 
 
 class XhsCrawler:
@@ -174,12 +296,20 @@ class XhsCrawler:
     def __init__(self, use_mock: bool = False, headless: bool = False,
                  user_data_dir: Optional[str] = None,
                  log_fn: Optional[Callable[[str, str], None]] = None,
-                 executable_path: Optional[str] = None):
+                 executable_path: Optional[str] = None,
+                 humanize: Optional[Dict[str, Any]] = None):
         self.use_mock = use_mock
         self.headless = headless
         self.user_data_dir = user_data_dir or os.path.join(tempfile.gettempdir(), "xhsreview_profile")
         self.log_fn = log_fn or (lambda lvl, msg: None)
         self.executable_path = executable_path or os.environ.get("XHS_CHROME_EXE") or _autodetect_chrome()
+
+        # 拟人化 / 防封配置：用户配置覆盖默认值，保证缺字段也不报错
+        self.humanize: Dict[str, Any] = dict(HUMANIZE_DEFAULTS)
+        if isinstance(humanize, dict):
+            self.humanize.update(humanize)
+        # 便捷取值：带默认值兜底
+        self._hz = lambda k, d=None: self.humanize.get(k, HUMANIZE_DEFAULTS.get(k, d))
 
         # 异步模式状态
         self._cmd_queue: Optional[_queue.Queue] = None
@@ -326,12 +456,14 @@ class XhsCrawler:
         result = self._submit("like_note", {"note_id": note_id}, timeout=30.0)
         return bool(result)
 
-    def post_comment(self, note_id: str, text: str) -> tuple[bool, str]:
+    def post_comment(self, note_id: str, text: str, context_text: str = "") -> tuple[bool, str]:
         if self.use_mock:
             if not text or not text.strip():
                 return False, "回复内容为空"
             return True, "mock-ok"
-        result = self._submit("post_comment", {"note_id": note_id, "text": text}, timeout=45.0)
+        result = self._submit("post_comment",
+                               {"note_id": note_id, "text": text, "context_text": context_text},
+                               timeout=60.0)
         if isinstance(result, tuple) and len(result) == 2:
             return result
         return False, "worker 返回异常"
@@ -402,6 +534,7 @@ class XhsCrawler:
         "--disable-dev-shm-usage",
         "--disable-extensions",
         "--disable-popup-blocking",
+        "--lang=zh-CN",
     ]
 
     _COMMON_KWARGS = dict(
@@ -607,17 +740,9 @@ class XhsCrawler:
                                 "（内置 Chromium + 系统 Chrome CDP）"
                             )
 
-                        # 反自动化检测
+                        # 反自动化 / 反指纹检测
                         try:
-                            context.add_init_script(
-                                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                                "window.navigator.chrome = { runtime: {}, }; "
-                                "const originalQuery = window.navigator.permissions.query; "
-                                "window.navigator.permissions.query = (parameters) => ("
-                                "parameters.name === 'notifications' ? "
-                                "Promise.resolve({ state: Notification.permission }) : "
-                                "originalQuery(parameters));"
-                            )
+                            context.add_init_script(_STEALTH_INIT_SCRIPT)
                         except Exception:
                             pass
 
@@ -679,7 +804,8 @@ class XhsCrawler:
                         result = self._do_like(page, payload.get("note_id", ""))
                     elif action == "post_comment":
                         result = self._do_post_comment(page, payload.get("note_id", ""),
-                                                       payload.get("text", ""))
+                                                       payload.get("text", ""),
+                                                       payload.get("context_text", ""))
                     elif action == "recheck_login":
                         logged_in = self._check_login(page)
                         with self._logged_in_lock:
@@ -1575,14 +1701,28 @@ class XhsCrawler:
             cls = btn.get_attribute("class") or ""
             if "active" in cls or "liked" in cls:
                 return True
-            btn.click()
+            # 偶发「犹豫了没点赞」：鼠标靠近、停顿、又移开——真人也会临阵反悔
+            if self._hz("enabled", True) and random.random() < self._hz("hesitate_prob", 0.04):
+                self._human_mouse_approach(page, btn)
+                time.sleep(random.uniform(0.3, 0.9))
+                try:
+                    page.mouse.move(btn.bounding_box()["x"] - random.randint(40, 90),
+                                    btn.bounding_box()["y"] - random.randint(40, 90),
+                                    steps=random.randint(3, 6))
+                except Exception:
+                    pass
+                self._log("info", f"🤔 犹豫了没点赞: {note_id}")
+                return False
+            self._human_mouse_approach(page, btn)
+            btn.click(steps=random.randint(3, 9))
             time.sleep(random.uniform(0.4, 0.9))
             return True
         except Exception as e:
             self._log("err", f"点赞失败 {note_id}: {e}")
             return False
 
-    def _do_post_comment(self, page: Page, note_id: str, text: str) -> tuple[bool, str]:
+    def _do_post_comment(self, page: Page, note_id: str, text: str,
+                         context_text: str = "") -> tuple[bool, str]:
         """在帖子详情页发布评论
 
         XHS 评论区真实交互流程（2026-07 实测）：
@@ -1624,6 +1764,20 @@ class XhsCrawler:
                 with self._logged_in_lock:
                     self._logged_in = False
                 return False, "详情页需登录（登录态已失效）"
+
+            # ── 0.5 阅读停留（拟人化：评论前先把帖子「读完」）──
+            self._read_dwell(context_text)
+
+            # ── 0.6 先下滑「看一眼」已有评论，再滚回输入框（更像真人发评前的浏览）──
+            if self._hz("glance_comments", True):
+                try:
+                    for _ in range(random.randint(1, 2)):
+                        page.mouse.wheel(0, random.randint(200, 500))
+                        time.sleep(random.uniform(0.4, 1.1))
+                    page.mouse.wheel(0, -random.randint(250, 600))
+                    time.sleep(random.uniform(0.4, 0.9))
+                except Exception:
+                    pass
 
             # ── 1. 点击输入框激活（真实鼠标点击，触发 Vue 激活态）──
             activated = self._activate_comment_input(page)
@@ -1676,7 +1830,7 @@ class XhsCrawler:
             try:
                 loc = page.get_by_text(kw, exact=False).first
                 if loc.count() > 0:
-                    loc.click(timeout=3000, force=True)
+                    self._human_click(page, loc, timeout=3000, force=True)
                     self._log("info", f"  [activate] 真实点击占位文字「{kw}」")
                     return True
             except Exception:
@@ -1690,7 +1844,8 @@ class XhsCrawler:
                 for el in page.query_selector_all(sel):
                     txt = (el.inner_text() or "").strip()
                     if txt and any(k in txt for k in ("评论", "点击评论", "荒地", "说点什么")):
-                        el.click(force=True, timeout=3000)
+                        self._human_mouse_approach(page, el)
+                        el.click(force=True, timeout=3000, steps=random.randint(3, 9))
                         self._log("info", f"  [activate] 真实点击占位: {sel} (txt={txt[:20]})")
                         return True
             except Exception:
@@ -1780,11 +1935,14 @@ class XhsCrawler:
         # 真实点击聚焦（按类型定位，确保鼠标真正落到输入框上）
         try:
             if info.get("isCE"):
-                page.locator('[contenteditable="true"]').first.click(timeout=4000, force=True)
+                self._human_click(page, page.locator('[contenteditable="true"]').first,
+                                  timeout=4000, force=True)
             elif info.get("tag") == "TEXTAREA":
-                page.locator("textarea").first.click(timeout=4000, force=True)
+                self._human_click(page, page.locator("textarea").first,
+                                  timeout=4000, force=True)
             else:
-                page.locator('input[type="text"], input[type="search"]').first.click(timeout=4000, force=True)
+                self._human_click(page, page.locator('input[type="text"], input[type="search"]').first,
+                                  timeout=4000, force=True)
         except Exception as e:
             self._log("warn", f"  [focus] 真实点击失败，回退 JS focus: {e}")
             try:
@@ -1825,7 +1983,8 @@ class XhsCrawler:
                 try:
                     btn = page.query_selector(sel)
                     if btn and btn.is_visible():
-                        btn.click(force=True, timeout=3000)
+                        self._human_mouse_approach(page, btn)
+                        btn.click(force=True, timeout=3000, steps=random.randint(3, 9))
                         self._log("info", f"  [send] {sel}")
                         return True
                 except Exception:
@@ -1988,10 +2147,92 @@ class XhsCrawler:
 
     def _human_scroll(self, page: Page):
         try:
-            for _ in range(random.randint(2, 4)):
-                delta = random.randint(400, 800)
-                page.mouse.wheel(0, delta)
-                time.sleep(random.uniform(0.15, 0.4))
+            # 拟人化滚动：偶发停顿「看一眼」、偶发向上回滚（模拟回看）
+            if self._hz("scroll_human", True):
+                pause_p = self._hz("scroll_pause_prob", 0.30)
+                back_p = self._hz("scroll_back_prob", 0.25)
+                for _ in range(random.randint(2, 4)):
+                    # 偶发向上回滚（仅在已向下滚动一段后才有意义，这里用小概率模拟回看）
+                    if random.random() < back_p:
+                        page.mouse.wheel(0, -random.randint(150, 350))
+                        time.sleep(random.uniform(0.2, 0.5))
+                    delta = random.randint(400, 800)
+                    page.mouse.wheel(0, delta)
+                    time.sleep(random.uniform(0.15, 0.4))
+                    if random.random() < pause_p:
+                        # 滚动中突然停住「看一眼」再继续
+                        time.sleep(random.uniform(0.6, 1.8))
+            else:
+                for _ in range(random.randint(2, 4)):
+                    delta = random.randint(400, 800)
+                    page.mouse.wheel(0, delta)
+                    time.sleep(random.uniform(0.15, 0.4))
+        except Exception:
+            pass
+
+    def _human_mouse_approach(self, page: Page, target):
+        """点击前用曲线 + 抖动的鼠标移动靠近目标，避免「瞬间瞬移」这类自动化特征。
+
+        target 可为 Locator / ElementHandle / 带 bounding_box() 的对象。
+        """
+        if not self._hz("enabled", True) or not self._hz("mouse_human_move", True):
+            return
+        try:
+            box = None
+            try:
+                box = target.bounding_box()
+            except Exception:
+                box = None
+            if not box:
+                return
+            cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            cy = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+            # 从一个随机偏移起点出发
+            sx = cx + random.randint(-60, 60)
+            sy = cy + random.randint(-60, 60)
+            page.mouse.move(sx, sy)
+            # 中途加一个随机 waypoint，形成曲线而非直线
+            page.mouse.move(
+                cx + random.randint(-20, 20),
+                cy + random.randint(-20, 20),
+                steps=random.randint(3, 7),
+            )
+            # 最终贴近目标中心（带极小抖动）
+            page.mouse.move(cx + random.randint(-3, 3), cy + random.randint(-3, 3),
+                            steps=random.randint(2, 5))
+            time.sleep(random.uniform(0.05, 0.2))
+            # 偶发「过冲再修正」：真实手会冲过头一点再拉回来，比精确落点更拟真
+            if random.random() < self._hz("mouse_overshoot_prob", 0.40):
+                ox = cx + random.choice([-1, 1]) * random.randint(8, 22)
+                oy = cy + random.choice([-1, 1]) * random.randint(8, 22)
+                page.mouse.move(ox, oy, steps=random.randint(2, 4))
+                time.sleep(random.uniform(0.04, 0.12))
+                page.mouse.move(cx + random.randint(-2, 2), cy + random.randint(-2, 2),
+                                steps=random.randint(2, 4))
+                time.sleep(random.uniform(0.04, 0.12))
+        except Exception:
+            pass
+
+    def _human_click(self, page: Page, target, timeout: float = 3000, force: bool = False):
+        """拟人化点击：先曲线移动鼠标，再以多步动画落点（steps 让移动有过程）"""
+        self._human_mouse_approach(page, target)
+        target.click(timeout=timeout, force=force, steps=random.randint(3, 9))
+
+    def _read_dwell(self, context_text: str):
+        """评论前的「阅读停留」：按帖子长度估算，叠加随机地板/天花板。"""
+        if not self._hz("read_enabled", True):
+            return
+        try:
+            length = max(0, len(context_text or ""))
+            per = self._hz("read_per_char", 0.010)
+            floor = self._hz("read_min", 1.5)
+            ceil = self._hz("read_max", 5.0)
+            dwell = floor + length * per
+            dwell = min(dwell, ceil)
+            # 再叠一点随机抖动，避免每次停留时长雷同
+            dwell = dwell * random.uniform(0.8, 1.2)
+            if dwell > 0.3:
+                time.sleep(dwell)
         except Exception:
             pass
 
@@ -2003,6 +2244,38 @@ class XhsCrawler:
             return ""
 
     def _type_humanly(self, page: Page, text: str):
+        """拟人化逐字输入：
+
+        - 每字基础延迟在 [type_min_delay, type_max_delay] 间随机（避免恒定节奏）
+        - 偶发「卡顿停顿」（type_pause_prob）模拟思考/被打断
+        - 偶发「打错一个字再删掉重打」的结巴（type_typo_rate），净输出不变，
+          但能打乱输入时序、更贴近真人
+        """
+        if not self._hz("enabled", True):
+            for ch in text:
+                page.keyboard.type(ch)
+                time.sleep(random.uniform(0.02, 0.08))
+            return
+
+        tmin = self._hz("type_min_delay", 0.06)
+        tmax = self._hz("type_max_delay", 0.20)
+        pause_p = self._hz("type_pause_prob", 0.10)
+        pmin = self._hz("type_pause_min", 0.30)
+        pmax = self._hz("type_pause_max", 1.00)
+        typo_p = self._hz("type_typo_rate", 0.05)
+
         for ch in text:
             page.keyboard.type(ch)
-            time.sleep(random.uniform(0.02, 0.08))
+            time.sleep(random.uniform(tmin, tmax))
+            # 偶发停顿
+            if random.random() < pause_p:
+                time.sleep(random.uniform(pmin, pmax))
+            # 偶发结巴：把刚打的字再打一遍再删掉（净结果正确，但时序更自然）
+            if typo_p > 0 and random.random() < typo_p and ch.strip():
+                try:
+                    page.keyboard.type(ch)
+                    time.sleep(random.uniform(tmin, tmax))
+                    page.keyboard.press("Backspace")
+                    time.sleep(random.uniform(0.1, 0.35))
+                except Exception:
+                    pass

@@ -53,6 +53,7 @@ class App:
             headless=self.config.get("headless", False),
             user_data_dir=self.config.get("user_data_dir") or None,
             log_fn=self._on_crawler_log,
+            humanize=self.config.data.get("humanize", {}),
         )
         self.scheduler = Scheduler(
             crawler=self.crawler, ai=self.ai,
@@ -405,6 +406,13 @@ class App:
         tk.Label(ai, text="（已有滚动延迟，可关闭）", bg=COLORS["bg_panel"],
                  fg=COLORS["fg_sub"], font=FONTS["small"]).grid(row=0, column=14, sticky="w", padx=(10, 0))
 
+        # 拟人化 / 防封设置入口
+        hz_btn = ttk.Button(ai, text="🛡 拟人化设置", command=self._open_humanize_dialog)
+        hz_btn.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        tk.Label(ai, text="（打字/阅读/滚动/鼠标/节奏/会话上限，全部可调，默认已开启防封）",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"],
+                 font=FONTS["small"]).grid(row=1, column=4, columnspan=11, sticky="w", padx=(10, 0), pady=(8, 0))
+
         # ============== 统计 ==============
         stat_frame = tk.LabelFrame(self.root, text="  本次统计  ", bg=COLORS["bg_panel"],
                                    fg=COLORS["fg_section"], font=FONTS["section"],
@@ -618,6 +626,7 @@ class App:
             headless=self.config.get("headless", False),
             user_data_dir=self.config.get("user_data_dir") or None,
             log_fn=self._on_crawler_log,
+            humanize=self.config.data.get("humanize", {}),
         )
         self.scheduler = Scheduler(
             crawler=self.crawler, ai=self.ai,
@@ -705,6 +714,167 @@ class App:
         else:
             self.btn_mode.config(text="🌐 真实抓取：开")
         self._append_log("info", f"已切换到 {'虚拟数据' if not cur else '真实抓取'} 模式（重启任务后生效）")
+
+    # ============== 拟人化 / 防封设置弹窗 ==============
+    def _open_humanize_dialog(self):
+        HZ_DEFAULTS = {
+            "enabled": True, "type_min_delay": 0.06, "type_max_delay": 0.20,
+            "type_pause_prob": 0.10, "type_pause_min": 0.30, "type_pause_max": 1.00,
+            "type_typo_rate": 0.05, "read_enabled": True, "read_per_char": 0.010,
+            "read_min": 1.5, "read_max": 5.0, "scroll_human": True,
+            "scroll_pause_prob": 0.30, "scroll_back_prob": 0.25,
+            "mouse_human_move": True, "mouse_overshoot_prob": 0.40, "hesitate_prob": 0.04,
+            "no_comment_rate": 12, "content_typo_rate": 0.15, "content_emoji_rate": 0.50,
+            "content_truncate_rate": 0.12, "glance_comments": True,
+            "skip_rate": 20, "long_break_prob": 0.07,
+            "long_break_min": 30, "long_break_max": 120, "session_action_cap": 35,
+            "session_break_min": 120, "session_break_max": 300, "randomize_order": True,
+        }
+        # 字段定义：(类型, key, 标签, min, max, step) 或 (分组标题, 标题)
+        fields = [
+            ("group", "打字拟人"),
+            ("bool", "enabled", "总开关（关闭则退化为简单随机）"),
+            ("num", "type_min_delay", "每字延迟下限(秒)", 0.01, 0.5, 0.01),
+            ("num", "type_max_delay", "每字延迟上限(秒)", 0.01, 1.0, 0.01),
+            ("num", "type_pause_prob", "输入中卡顿概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "type_pause_min", "卡顿停顿下限(秒)", 0.0, 5.0, 0.1),
+            ("num", "type_pause_max", "卡顿停顿上限(秒)", 0.0, 10.0, 0.1),
+            ("num", "type_typo_rate", "打错一个字再删概率(0~1)", 0.0, 1.0, 0.01),
+            ("group", "阅读停留（评论前先读完帖子）"),
+            ("bool", "read_enabled", "启用阅读停留"),
+            ("num", "read_per_char", "每字符阅读耗时(秒)", 0.0, 0.1, 0.001),
+            ("num", "read_min", "最短停留(秒)", 0.0, 30.0, 0.5),
+            ("num", "read_max", "最长停留(秒)", 0.0, 60.0, 0.5),
+            ("group", "滚动拟人"),
+            ("bool", "scroll_human", "启用拟人滚动"),
+            ("num", "scroll_pause_prob", "滚动中停顿概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "scroll_back_prob", "向上回滚概率(0~1)", 0.0, 1.0, 0.01),
+            ("group", "鼠标拟人"),
+            ("bool", "mouse_human_move", "点击前曲线移动鼠标（避免瞬移）"),
+            ("num", "mouse_overshoot_prob", "落点过冲再修正概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "hesitate_prob", "犹豫了没点赞概率(0~1)", 0.0, 1.0, 0.01),
+            ("group", "AI 回复内容拟人（防 AI 味 / 人工审核）"),
+            ("num", "no_comment_rate", "看了但不评论率(%)", 0, 100, 1),
+            ("num", "content_typo_rate", "偶发错别字概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "content_emoji_rate", "追加 emoji 概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "content_truncate_rate", "只保留前半句概率(0~1)", 0.0, 1.0, 0.01),
+            ("group", "行为节奏"),
+            ("num", "skip_rate", "纯浏览跳过率(%)", 0, 100, 1),
+            ("num", "long_break_prob", "偶发长休息概率(0~1)", 0.0, 1.0, 0.01),
+            ("num", "long_break_min", "长休息下限(秒)", 0, 600, 1),
+            ("num", "long_break_max", "长休息上限(秒)", 0, 1800, 1),
+            ("group", "会话安全上限（防频次异常）"),
+            ("num", "session_action_cap", "操作上限(次,0=不限)", 0, 500, 1),
+            ("num", "session_break_min", "会话长休下限(秒)", 0, 1800, 10),
+            ("num", "session_break_max", "会话长休上限(秒)", 0, 3600, 10),
+            ("group", "其他"),
+            ("bool", "glance_comments", "评论前先下滑看一眼已有评论再回来"),
+            ("bool", "randomize_order", "点赞/评论顺序随机"),
+        ]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("拟人化 / 防封设置")
+        dlg.configure(bg=COLORS["bg_panel"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("620x560")
+
+        # 顶部说明
+        tk.Label(dlg, text="这些设置让自动化行为更接近真人，降低被小红书风控识别的概率。",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"], font=FONTS["small"]).pack(
+            anchor="w", padx=14, pady=(10, 4))
+
+        # 可滚动容器
+        canvas = tk.Canvas(dlg, bg=COLORS["bg_panel"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(dlg, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=(0, 6))
+        scrollbar.pack(side="right", fill="y", pady=(0, 6))
+
+        inner = tk.Frame(canvas, bg=COLORS["bg_panel"])
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_canvas_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_canvas_configure)
+
+        # 当前值（用户在 config 里已有的覆盖默认）
+        cur = dict(HZ_DEFAULTS)
+        saved = self.config.data.get("humanize", {}) or {}
+        if isinstance(saved, dict):
+            cur.update(saved)
+
+        vars_dict: dict = {}
+        row = 0
+        for spec in fields:
+            if spec[0] == "group":
+                tk.Label(inner, text=spec[1], bg=COLORS["bg_panel"],
+                         fg=COLORS["fg_section"], font=FONTS["section"]).grid(
+                    row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            elif spec[0] == "bool":
+                key, label = spec[1], spec[2]
+                v = tk.BooleanVar(value=bool(cur.get(key, True)))
+                cb = ttk.Checkbutton(inner, text=label, variable=v)
+                cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=(8, 0))
+                vars_dict[key] = v
+            elif spec[0] == "num":
+                key, label, lo, hi, step = spec[1], spec[2], spec[3], spec[4], spec[5]
+                tk.Label(inner, text=label, bg=COLORS["bg_panel"],
+                         fg=COLORS["fg_text"], font=FONTS["normal"]).grid(
+                    row=row, column=0, sticky="w", padx=(8, 0))
+                val = cur.get(key, 0)
+                v = tk.StringVar(value=str(val))
+                sp = tk.Spinbox(inner, from_=lo, to=hi, increment=step, width=10,
+                                textvariable=v, bg=COLORS["bg_input"], fg=COLORS["fg_text"],
+                                buttonbackground=COLORS["btn_bg"], font=FONTS["normal"])
+                sp.grid(row=row, column=1, sticky="w", padx=(10, 0))
+                vars_dict[key] = v
+            row += 1
+
+        # 鼠标滚轮滚动
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # 底部按钮
+        btn_row = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        btn_row.pack(fill="x", padx=14, pady=(0, 10))
+
+        def _coerce(key, raw):
+            try:
+                # 保留整数形态（skip_rate / 各种上限）
+                f = float(raw)
+                if f == int(f) and key in (
+                    "skip_rate", "no_comment_rate", "long_break_min", "long_break_max",
+                    "session_action_cap", "session_break_min", "session_break_max"):
+                    return int(f)
+                return f
+            except Exception:
+                return HZ_DEFAULTS.get(key, 0)
+
+        def save():
+            canvas.unbind_all("<MouseWheel>")
+            new_hz = {}
+            for key, var in vars_dict.items():
+                if isinstance(var, tk.BooleanVar):
+                    new_hz[key] = bool(var.get())
+                else:
+                    new_hz[key] = _coerce(key, var.get())
+            self.config.set("humanize", new_hz)
+            self.config.save()
+            self._append_log("ok", "🛡 拟人化设置已保存（重启任务后生效）")
+            dlg.destroy()
+
+        def reset_defaults():
+            canvas.unbind_all("<MouseWheel>")
+            self.config.set("humanize", dict(HZ_DEFAULTS))
+            self.config.save()
+            self._append_log("ok", "🛡 已恢复拟人化默认设置")
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="恢复默认", command=reset_defaults).pack(side="left")
+        ttk.Button(btn_row, text="取消", command=lambda: (canvas.unbind_all("<MouseWheel>"), dlg.destroy())).pack(side="right", padx=4)
+        ttk.Button(btn_row, text="保存", command=save).pack(side="right", padx=4)
 
     # ============== API 配置弹窗 ==============
     def _open_api_dialog(self):
