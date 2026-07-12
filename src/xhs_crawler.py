@@ -24,6 +24,8 @@ import urllib.request
 from urllib.parse import urlparse
 from typing import Optional, Dict, List, Any, Callable, Tuple
 
+from .search_filters import SearchFilters, normalize_filters
+
 # Playwright 可选导入
 try:
     from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, TimeoutError as PWTimeout
@@ -415,9 +417,12 @@ class XhsCrawler:
 
     def _mock_dispatch(self, action: str, payload: dict):
         if action == "fetch_feed":
-            return self._fetch_mock_sync(payload.get("category", ""), payload.get("keyword", ""))
+            return self._fetch_mock_sync(payload.get("category", ""),
+                                         payload.get("keyword", ""),
+                                         payload.get("filters"))
         if action == "search_notes":
-            return self._search_mock_sync(payload.get("keyword", ""))
+            return self._search_mock_sync(payload.get("keyword", ""),
+                                          payload.get("filters"))
         if action == "open_note":
             return self._open_mock_sync(payload.get("note_id", ""))
         if action == "like_note":
@@ -426,18 +431,22 @@ class XhsCrawler:
             return (True, "mock-ok")
         return None
 
-    def fetch_feed(self, scroll_times: int = 2, category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
+    def fetch_feed(self, scroll_times: int = 2, category: str = "", keyword: str = "",
+                   filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         if self.use_mock:
-            return self._fetch_mock_sync(category, keyword)
+            return self._fetch_mock_sync(category, keyword, filters)
         result = self._submit("fetch_feed", {"scroll_times": scroll_times,
-                                              "category": category, "keyword": keyword},
+                                              "category": category, "keyword": keyword,
+                                              "filters": filters},
                                timeout=60.0)
         return result if isinstance(result, list) else []
 
-    def search_notes(self, keyword: str) -> List[Dict[str, Any]]:
+    def search_notes(self, keyword: str,
+                     filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         if self.use_mock:
-            return self._search_mock_sync(keyword)
-        result = self._submit("search_notes", {"keyword": keyword}, timeout=60.0)
+            return self._search_mock_sync(keyword, filters)
+        result = self._submit("search_notes", {"keyword": keyword, "filters": filters},
+                               timeout=60.0)
         return result if isinstance(result, list) else []
 
     def open_note(self, note_id: str, fallback_title: str = "") -> Optional[Dict[str, Any]]:
@@ -468,6 +477,15 @@ class XhsCrawler:
             return result
         return False, "worker 返回异常"
 
+    def analyze_page_filters(self) -> Dict[str, Any]:
+        """实时分析当前页面上的筛选面板结构（需在浏览器已启动后调用）。"""
+        if self.use_mock:
+            return {"mode": "mock", "filters": SearchFilters().to_dict()}
+        result = self._submit("analyze_page_filters", {}, timeout=30.0)
+        if isinstance(result, dict):
+            return result
+        return {"error": "worker 未返回有效结果"}
+
     @property
     def is_logged_in(self) -> bool:
         with self._logged_in_lock:
@@ -481,20 +499,35 @@ class XhsCrawler:
         return bool(result)
 
     # ---------------- 虚拟数据 ----------------
-    def _fetch_mock_sync(self, category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
+    def _fetch_mock_sync(self, category: str = "", keyword: str = "",
+                         filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         out = []
         for p in MOCK_POSTS:
             text = (p["title"] + " " + p["content"]).lower()
             if keyword and keyword.lower() not in text:
                 continue
             out.append(dict(p))
-        self._log("ok", f"[MOCK] 抓取到 {len(out)} 条帖子 (keyword={keyword!r})")
+        if filters:
+            try:
+                sf = SearchFilters.from_dict(normalize_filters(filters))
+                out = sf.apply_to_posts(out)
+            except Exception:
+                pass
+        self._log("ok", f"[MOCK] 抓取到 {len(out)} 条帖子 (keyword={keyword!r}, filters={filters})")
         return out
 
-    def _search_mock_sync(self, keyword: str) -> List[Dict[str, Any]]:
+    def _search_mock_sync(self, keyword: str,
+                          filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not keyword:
             return []
-        return [dict(p) for p in MOCK_POSTS if keyword in (p["title"] + p["content"])]
+        out = [dict(p) for p in MOCK_POSTS if keyword in (p["title"] + p["content"])]
+        if filters:
+            try:
+                sf = SearchFilters.from_dict(normalize_filters(filters))
+                out = sf.apply_to_posts(out)
+            except Exception:
+                pass
+        return out
 
     def _open_mock_sync(self, note_id: str) -> Optional[Dict[str, Any]]:
         for p in MOCK_POSTS:
@@ -794,9 +827,11 @@ class XhsCrawler:
                     if action == "fetch_feed":
                         result = self._do_fetch_feed(page, payload.get("scroll_times", 2),
                                                      payload.get("category", ""),
-                                                     payload.get("keyword", ""))
+                                                     payload.get("keyword", ""),
+                                                     payload.get("filters"))
                     elif action == "search_notes":
-                        result = self._do_search(page, payload.get("keyword", ""))
+                        result = self._do_search(page, payload.get("keyword", ""),
+                                                  payload.get("filters"))
                     elif action == "open_note":
                         result = self._do_open_note(page, payload.get("note_id", ""),
                                                     payload.get("fallback_title", ""))
@@ -811,6 +846,8 @@ class XhsCrawler:
                         with self._logged_in_lock:
                             self._logged_in = logged_in
                         result = logged_in
+                    elif action == "analyze_page_filters":
+                        result = self._analyze_page_filters(page)
                     else:
                         result = None
                     if reply:
@@ -901,6 +938,53 @@ class XhsCrawler:
             return "search_result" in url or "search/" in url
         except Exception:
             return False
+
+    def _analyze_page_filters(self, page: Page) -> Dict[str, Any]:
+        """实时分析当前页面上的筛选面板，返回可见的筛选分类与选项文本。
+
+        用于「脚本在运行时可以实时分析网页结构」的需求：
+        在浏览器已经打开到小红书搜索页时，点击「实时分析页面筛选」即可读取
+        页面上排序依据 / 笔记类型 / 发布时间 / 搜索范围 / 位置距离 等选项。
+        """
+        try:
+            data = page.evaluate("""() => {
+                const labels = ['排序依据', '笔记类型', '发布时间', '搜索范围', '位置距离'];
+                const out = {url: window.location.href, filters: {}};
+                const all = Array.from(document.querySelectorAll('*'));
+                for (const label of labels) {
+                    // 找到包含该分类标题的可见元素
+                    const el = all.find(e => {
+                        const t = (e.textContent || '').trim();
+                        return t === label && e.children.length > 0;
+                    });
+                    if (!el) continue;
+                    // 向上遍历几个父级，收集按钮/span/div 中的选项文本
+                    let container = el.parentElement;
+                    let found = false;
+                    for (let i = 0; i < 6 && container; i++) {
+                        const items = Array.from(container.querySelectorAll('button, span, div, a'))
+                            .filter(b => {
+                                const t = (b.textContent || '').trim();
+                                return t && t !== label && t.length < 12 &&
+                                       b.getBoundingClientRect().width > 0;
+                            })
+                            .map(b => b.textContent.trim());
+                        if (items.length >= 2) {
+                            out.filters[label] = items.slice(0, 15);
+                            found = true;
+                            break;
+                        }
+                        container = container.parentElement;
+                    }
+                    if (!found) out.filters[label] = [];
+                }
+                return out;
+            }""")
+            self._log("info", f"🧠 实时分析页面筛选完成：{data.get('url')}")
+            return data
+        except Exception as e:
+            self._log("warn", f"实时分析页面筛选失败: {e}")
+            return {"error": str(e)}
 
     def _is_404(self, page) -> bool:
         """判断当前是否落到了 XHS 的 404/扫码拦截中转页"""
@@ -1245,11 +1329,13 @@ class XhsCrawler:
         )
 
     def _do_fetch_feed(self, page: Page, scroll_times: int,
-                       category: str = "", keyword: str = "") -> List[Dict[str, Any]]:
+                       category: str = "", keyword: str = "",
+                       filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         try:
             if keyword:
-                url = self.SEARCH_URL_TPL.format(kw=keyword)
-                self._log("info", f"按关键词搜索: {keyword}")
+                sf = SearchFilters.from_dict(normalize_filters(filters)) if filters else SearchFilters()
+                url = sf.build_search_url(keyword)
+                self._log("info", f"按关键词搜索: {keyword} (筛选={sf.to_dict()})")
                 self._last_fetch_was_search = True
                 self._last_search_keyword = keyword
                 self._navigate_with_retry(page, url)
@@ -1294,10 +1380,11 @@ class XhsCrawler:
             self._log("err", f"抓取失败: {e}")
             return []
 
-    def _do_search(self, page: Page, keyword: str) -> List[Dict[str, Any]]:
+    def _do_search(self, page: Page, keyword: str,
+                   filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not keyword:
             return []
-        return self._do_fetch_feed(page, 1, "", keyword=keyword)
+        return self._do_fetch_feed(page, 1, "", keyword=keyword, filters=filters)
 
     def _extract_feed_cards(self, page: Page, max_items: int = 20,
                             scroll_times: int = 1) -> List[Dict[str, Any]]:

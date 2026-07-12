@@ -13,6 +13,11 @@ logs/
 *.html
 !config.example.json
 
+# ===== Build artifacts =====
+build/
+dist/
+.build-venv/
+
 # ===== Tooling / memory =====
 .workbuddy/
 

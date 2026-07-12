@@ -31,14 +31,33 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # === 搜索关键词（覆盖板块，留空则用板块推荐流） ===
     "search_keyword": "",
 
+    # === 搜索筛选（对应网页端「筛选」面板） ===
+    "search_filters": {
+        "sort_by":      "综合",
+        "note_type":    "不限",
+        "publish_time": "不限",
+        "search_scope": "不限",
+        "location":     "不限",
+    },
+
     # === 行为概率 ===
     "auto_like":     False,
-    "like_rate":     30,
+    "like_rate":     10,      # 默认极低：警告后已确认高频点赞是强风控信号
     "auto_reply":    True,
-    "reply_rate":    80,
+    "reply_rate":    25,      # 默认极低：多数帖子只浏览，少量帖子回复
     "enable_wait":   True,
-    "wait_min":      1,
-    "wait_max":      3,
+    "wait_min":      3,       # 帖子间最短等待
+    "wait_max":      8,       # 帖子间最长等待
+
+    # === 运营画像 / 跨日风控（P1：警告后补上的关键层） ===
+    # 平台会看「每日总操作量」和「活跃时间分布」。24 小时匀速在线、凌晨仍在操作是极强 bot 信号。
+    "daily_quota_enabled":   True,
+    "daily_like_limit":        15,       # 每日点赞上限（跨重启累计）
+    "daily_reply_limit":       12,       # 每日评论上限（跨重启累计）
+    "active_hours_enabled":    True,
+    "active_hours_start":      "09:00",  # 真人活跃开始时间
+    "active_hours_end":        "23:00",  # 真人活跃结束时间
+    "min_restart_interval_min": 30,       # 两次运行最小间隔（分钟）
 
     # === 拟人化 / 防封（核心：让自动化行为难以被平台风控识别） ===
     # 所有旋钮均可单独关闭；默认值偏「安全且自然」，可根据账号权重自行调激进/保守。
@@ -47,46 +66,46 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled":                 True,
 
         # —— 打字拟人 ——
-        "type_min_delay":          0.06,   # 每个字符基础延迟下限（秒）
-        "type_max_delay":          0.20,   # 每个字符基础延迟上限（秒）
-        "type_pause_prob":         0.10,   # 输入过程中偶发「卡顿停顿」的概率
-        "type_pause_min":          0.30,   # 卡顿停顿时长下限（秒）
-        "type_pause_max":          1.00,   # 卡顿停顿时长上限（秒）
-        "type_typo_rate":          0.05,   # 偶发「打错一个字再删掉」的结巴概率（净输出不变）
+        "type_min_delay":          0.08,   # 每个字符基础延迟下限（秒）
+        "type_max_delay":          0.35,   # 每个字符基础延迟上限（秒）
+        "type_pause_prob":         0.15,   # 输入过程中偶发「卡顿停顿」的概率
+        "type_pause_min":          0.50,   # 卡顿停顿时长下限（秒）
+        "type_pause_max":          1.50,   # 卡顿停顿时长上限（秒）
+        "type_typo_rate":          0.08,   # 偶发「打错一个字再删掉」的结巴概率（净输出不变）
 
         # —— 阅读停留（评论前先「读完帖子」） ——
         "read_enabled":            True,
-        "read_per_char":           0.010,  # 每字符阅读耗时（秒），帖子越长停留越久
-        "read_min":                1.5,    # 最短阅读停留（秒）
-        "read_max":                5.0,    # 最长阅读停留上限（秒，避免过长）
+        "read_per_char":           0.015,  # 每字符阅读耗时（秒），帖子越长停留越久
+        "read_min":                2.5,    # 最短阅读停留（秒）
+        "read_max":                8.0,    # 最长阅读停留上限（秒，避免过长）
 
         # —— 滚动拟人 ——
         "scroll_human":            True,
-        "scroll_pause_prob":       0.30,   # 滚动过程中偶发停顿「看一眼」的概率
-        "scroll_back_prob":        0.25,   # 偶发向上回滚（模拟回看）的概率
+        "scroll_pause_prob":       0.40,   # 滚动过程中偶发停顿「看一眼」的概率
+        "scroll_back_prob":        0.30,   # 偶发向上回滚（模拟回看）的概率
 
         # —— 鼠标拟人移动（点击前先曲线靠近，避免瞬移） ——
         "mouse_human_move":        True,
-        "mouse_overshoot_prob":    0.40,   # 落点前偶发「过冲再修正」，比直线更拟真
-        "hesitate_prob":           0.04,   # 偶发「犹豫了没点赞」（只靠近不点，模拟真人）
+        "mouse_overshoot_prob":    0.50,   # 落点前偶发「过冲再修正」，比直线更拟真
+        "hesitate_prob":           0.06,   # 偶发「犹豫了没点赞」（只靠近不点，模拟真人）
 
         # —— AI 回复内容拟人（防「AI 味」与人工审核） ——
-        "no_comment_rate":         12,     # % 概率「看了但不评论」（连 AI 调用都省，更自然）
-        "content_typo_rate":       0.15,   # 偶发轻微错别字（同音/形近，不影响理解）
-        "content_emoji_rate":      0.50,   # 偶发追加 1 个随机 emoji（自然口语化）
-        "content_truncate_rate":   0.12,   # 偶发只保留前半句（短评更真实）
+        "no_comment_rate":         25,     # % 概率「看了但不评论」（连 AI 调用都省，更自然）
+        "content_typo_rate":       0.20,   # 偶发轻微错别字（同音/形近，不影响理解）
+        "content_emoji_rate":      0.40,   # 偶发追加 1 个随机 emoji（自然口语化）
+        "content_truncate_rate":   0.18,   # 偶发只保留前半句（短评更真实）
         "glance_comments":         True,   # 评论前先下滑「看一眼」已有评论再回来
 
         # —— 行为节奏 ——
-        "skip_rate":               20,     # % 概率完全跳过某帖（只浏览，不点赞不评论）
-        "long_break_prob":         0.07,   # 每帖处理后偶发「长休息」的概率
-        "long_break_min":          30,     # 长休息时长下限（秒）
-        "long_break_max":          120,    # 长休息时长上限（秒）
+        "skip_rate":               45,     # % 概率完全跳过某帖（只浏览，不点赞不评论）
+        "long_break_prob":         0.15,   # 每帖处理后偶发「长休息」的概率
+        "long_break_min":          45,     # 长休息时长下限（秒）
+        "long_break_max":          180,    # 长休息时长上限（秒）
 
         # —— 会话安全上限（防频次异常） ——
-        "session_action_cap":      35,     # 累计点赞+评论达到该值后强制长休
-        "session_break_min":        120,    # 会话长休下限（秒）
-        "session_break_max":        300,   # 会话长休上限（秒）
+        "session_action_cap":      20,     # 累计点赞+评论达到该值后强制长休
+        "session_break_min":        180,    # 会话长休下限（秒）
+        "session_break_max":        600,   # 会话长休上限（秒）
 
         # —— 操作顺序随机 ——
         "randomize_order":         True,   # 每帖随机决定「先赞后评 / 先评后赞 / 只做其一」

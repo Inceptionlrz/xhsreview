@@ -9,6 +9,7 @@ from typing import Optional, Callable, Dict, Any, List
 
 from .anthropic_client import AnthropicClient
 from .xhs_crawler import XhsCrawler
+from .quota_tracker import QuotaTracker
 
 
 class Scheduler:
@@ -18,7 +19,7 @@ class Scheduler:
     设计：
     - 主循环在自己线程中跑（与 UI 线程分离）
     - 所有 XhsCrawler 调用现在已线程安全（内部用 worker 隔离 Playwright）
-    - 板块 / 关键词从 config 读取后传给 fetch_feed
+    - 板块 / 关键词 / 搜索筛选从 config 读取后传给 fetch_feed
     """
 
     def __init__(self, crawler: XhsCrawler, ai: AnthropicClient,
@@ -35,6 +36,7 @@ class Scheduler:
         self._thread: Optional[threading.Thread] = None
         self._processed_ids: set = set()
         self._session_actions: int = 0  # 本次会话累计操作数（用于会话安全上限）
+        self._quota = QuotaTracker()
         self._state = {
             "running":    False,
             "started_at": 0.0,
@@ -85,27 +87,41 @@ class Scheduler:
     # ---------------- 主循环 ----------------
     def _run(self):
         try:
+            # 启动前先做配额 / 时段检查
+            can_run, reason = self._quota.check(self.config)
+            if not can_run:
+                self._log("warn", f"⛔ {reason}")
+                return
+            self._quota.record_run_start()
+
             mode = self.config.get("mode", "unlimited")
             post_limit = int(self.config.get("post_limit", 50))
             time_limit = int(self.config.get("time_limit", 30)) * 60
             crawl_mode = self.config.get("crawl_mode", "deep")
             scroll_times = 3 if crawl_mode == "deep" else 1
 
-            # 板块 + 关键词
+            # 板块 + 关键词 + 筛选
             enabled_cats = self.config.get("enabled_categories") or []
             keyword = (self.config.get("search_keyword") or "").strip()
+            search_filters = self.config.get("search_filters") or {}
 
             # 板块选择：取第一个启用的板块作为抓取目标
             category = enabled_cats[0] if enabled_cats else ""
 
             self._log("ok", f"开始运行 | 模式={mode} | 板块={category or '全部'}"
-                           f" | 关键词={keyword or '(无)'}")
+                           f" | 关键词={keyword or '(无)'} | 筛选={search_filters}")
             self._log("info", "📊 统计追踪已启动：将记录点赞次数 / 评论次数")
             self._publish_state()
 
             batch_count = 0
             empty_rounds = 0
             while not self._stop_event.is_set():
+                # 运营画像检查：每日上限 / 活跃时段 / 最小重启间隔
+                can_run, reason = self._quota.check(self.config)
+                if not can_run:
+                    self._log("warn", f"⛔ {reason}")
+                    break
+
                 if mode == "count" and self._state["posts_seen"] >= post_limit:
                     self._log("ok", f"达到帖子数上限 {post_limit}，自动停止")
                     break
@@ -115,11 +131,12 @@ class Scheduler:
                         self._log("ok", f"达到时间上限 {time_limit // 60} 分钟，自动停止")
                         break
 
-                # 抓一批
+                # 抓一批（关键词搜索时带上筛选条件）
                 feed = self.crawler.fetch_feed(
                     scroll_times=scroll_times,
                     category=category,
                     keyword=keyword,
+                    filters=search_filters if keyword else None,
                 )
                 if not feed:
                     empty_rounds += 1
@@ -136,6 +153,13 @@ class Scheduler:
                 for post in feed:
                     if self._stop_event.is_set():
                         break
+                    # 逐帖前检查配额，防止批次内超限
+                    can_run, reason = self._quota.check(self.config)
+                    if not can_run:
+                        self._log("warn", f"⛔ {reason}")
+                        self._stop_event.set()
+                        break
+
                     self._state["posts_seen"] += 1
                     note_id = post.get("note_id", "")
                     if not note_id or note_id in self._processed_ids:
@@ -206,6 +230,7 @@ class Scheduler:
                                 self._log("ok", f"👍 点赞({self._state['liked']}次): {detail.get('title','')[:30]}")
                                 self._publish_state()
                                 self._session_actions += 1
+                                self._quota.add_like()
                             time.sleep(random.uniform(0.3, 0.8))
                         elif act == "reply":
                             title = detail.get("title", "")
@@ -237,6 +262,7 @@ class Scheduler:
                                     self._state["replied"] += 1
                                     self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
                                     self._session_actions += 1
+                                    self._quota.add_reply()
                                 else:
                                     self._log("err", f"回复失败: {msg}")
                                     self._state["errors"] += 1
@@ -261,6 +287,10 @@ class Scheduler:
             import traceback
             self._log("err", traceback.format_exc())
         finally:
+            try:
+                self._quota.record_run_end()
+            except Exception:
+                pass
             self._state["running"] = False
             self._publish_state()
 

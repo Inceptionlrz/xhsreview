@@ -9,7 +9,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # 使脚本与包都能 import
 if __package__ in (None, ""):
@@ -20,12 +20,14 @@ if __package__ in (None, ""):
     from src.anthropic_client import AnthropicClient
     from src.xhs_crawler import XhsCrawler
     from src.scheduler import Scheduler
+    from src.search_filters import SearchFilters, FILTER_CATEGORIES
 else:
     from .theme import COLORS, FONTS, SIZE, DEFAULT_CATEGORIES
     from .config import Config
     from .anthropic_client import AnthropicClient
     from .xhs_crawler import XhsCrawler
     from .scheduler import Scheduler
+    from .search_filters import SearchFilters, FILTER_CATEGORIES
 
 
 # ============== 颜色标记 ==============
@@ -291,6 +293,42 @@ class App:
         # 分隔
         tk.Frame(left_inner, height=1, bg=COLORS["border"]).pack(fill="x", pady=6)
 
+        # ============== 搜索筛选（对应网页端「筛选」面板）==============
+        filter_hdr = tk.Frame(left_inner, bg=COLORS["bg_panel"])
+        filter_hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(filter_hdr, text="🔍 搜索筛选", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_section"], font=FONTS["label"]).pack(side="left")
+        tk.Label(filter_hdr, text="（网页端同款条件，留空=不限）", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_sub"], font=FONTS["small"]).pack(side="left", padx=(6, 0))
+
+        self.filter_vars: Dict[str, tk.StringVar] = {}
+        self.filter_combos: Dict[str, ttk.Combobox] = {}
+        filter_grid = tk.Frame(left_inner, bg=COLORS["bg_panel"])
+        filter_grid.pack(fill="x")
+        for i, (key, label, options) in enumerate(FILTER_CATEGORIES):
+            row, col = divmod(i, 2)
+            tk.Label(filter_grid, text=label, bg=COLORS["bg_panel"],
+                     fg=COLORS["fg_text"], font=FONTS["small"]).grid(
+                row=row * 2, column=col, sticky="w", padx=(4, 2), pady=(2, 0))
+            v = tk.StringVar(value=options[0][0])
+            cb = ttk.Combobox(filter_grid, textvariable=v,
+                              values=[o[0] for o in options], width=10, state="readonly")
+            cb.grid(row=row * 2 + 1, column=col, sticky="we", padx=(4, 8), pady=(0, 4))
+            cb.bind("<<ComboboxSelected>>", self._on_filter_change)
+            self.filter_vars[key] = v
+            self.filter_combos[key] = cb
+        filter_grid.columnconfigure(0, weight=1)
+        filter_grid.columnconfigure(1, weight=1)
+
+        filter_btns = tk.Frame(left_inner, bg=COLORS["bg_panel"])
+        filter_btns.pack(fill="x", pady=(2, 0))
+        ttk.Button(filter_btns, text="🗑 重置", command=self._reset_filters).pack(side="left", padx=2)
+        ttk.Button(filter_btns, text="🔍 查看结果", command=self._on_view_filter_results).pack(side="left", padx=2)
+        ttk.Button(filter_btns, text="🧠 实时分析页面筛选", command=self._on_analyze_page_filters).pack(side="right", padx=2)
+
+        # 分隔
+        tk.Frame(left_inner, height=1, bg=COLORS["border"]).pack(fill="x", pady=6)
+
         # 板块标题 + 全选/全不选
         cat_hdr = tk.Frame(left_inner, bg=COLORS["bg_panel"])
         cat_hdr.pack(fill="x", pady=(0, 4))
@@ -412,6 +450,12 @@ class App:
         tk.Label(ai, text="（打字/阅读/滚动/鼠标/节奏/会话上限，全部可调，默认已开启防封）",
                  bg=COLORS["bg_panel"], fg=COLORS["fg_sub"],
                  font=FONTS["small"]).grid(row=1, column=4, columnspan=11, sticky="w", padx=(10, 0), pady=(8, 0))
+
+        quota_btn = ttk.Button(ai, text="🕐 运营画像", command=self._open_quota_dialog)
+        quota_btn.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        tk.Label(ai, text="（每日上限 / 活跃时段 / 最小重启间隔，警告后建议保持开启）",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"],
+                 font=FONTS["small"]).grid(row=2, column=4, columnspan=11, sticky="w", padx=(10, 0), pady=(4, 0))
 
         # ============== 统计 ==============
         stat_frame = tk.LabelFrame(self.root, text="  本次统计  ", bg=COLORS["bg_panel"],
@@ -571,6 +615,18 @@ class App:
             self.entry_keyword.delete(0, "end")
             self.entry_keyword.insert(0, kw)
 
+        # 搜索筛选
+        sf = c.get("search_filters", {})
+        if hasattr(self, "filter_combos"):
+            defaults = SearchFilters().to_dict()
+            for key, var in self.filter_vars.items():
+                val = sf.get(key, defaults.get(key))
+                combo = self.filter_combos[key]
+                valid = set(combo["values"])
+                if val not in valid:
+                    val = defaults.get(key)
+                var.set(val)
+
         # 代理
         proxy_val = c.get("proxy", "")
         self.entry_proxy.delete(0, "end")
@@ -590,6 +646,118 @@ class App:
 
         self._on_mode_change()
 
+    def _get_filters_dict(self) -> Dict[str, str]:
+        return {key: var.get() for key, var in self.filter_vars.items()}
+
+    def _on_filter_change(self, event=None):
+        filters = self._get_filters_dict()
+        self.config.set("search_filters", filters)
+        self.config.save()
+
+    def _reset_filters(self):
+        defaults = SearchFilters()
+        for key, var in self.filter_vars.items():
+            var.set(getattr(defaults, key))
+        self._on_filter_change()
+
+    def _on_view_filter_results(self):
+        keyword = self.entry_keyword.get().strip()
+        if not keyword:
+            messagebox.showwarning("缺少关键词", "请先输入搜索关键词")
+            return
+        filters = self._get_filters_dict()
+        self._on_filter_change()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("筛选结果预览")
+        dlg.configure(bg=COLORS["bg_panel"])
+        dlg.geometry("760x520")
+        dlg.transient(self.root)
+
+        top = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        top.pack(fill="x", padx=10, pady=(10, 6))
+        tk.Label(top, text=f"关键词：{keyword}", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_text"], font=FONTS["normal"]).pack(side="left")
+        tk.Label(top, text=f"筛选：{filters}", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_sub"], font=FONTS["small"]).pack(side="left", padx=(10, 0))
+
+        cols = ("title", "user", "likes", "comments", "note_id")
+        tree = ttk.Treeview(dlg, columns=cols, show="headings", height=18)
+        tree.heading("title", text="标题")
+        tree.heading("user", text="作者")
+        tree.heading("likes", text="点赞")
+        tree.heading("comments", text="评论")
+        tree.heading("note_id", text="笔记ID")
+        tree.column("title", width=300)
+        tree.column("user", width=120)
+        tree.column("likes", width=60)
+        tree.column("comments", width=60)
+        tree.column("note_id", width=160)
+        tree.pack(fill="both", expand=True, padx=10, pady=6)
+
+        status = tk.Label(dlg, text="正在搜索...", bg=COLORS["bg_panel"],
+                          fg=COLORS["fg_sub"], font=FONTS["small"])
+        status.pack(fill="x", padx=10, pady=(0, 10))
+
+        def _open_selected(_event=None):
+            selected = tree.selection()
+            if not selected:
+                return
+            item = tree.item(selected[0])
+            values = item.get("values") or []
+            note_id = values[-1] if values else None
+            if not note_id:
+                return
+            threading.Thread(target=lambda: self.crawler.open_note(str(note_id)),
+                             daemon=True).start()
+
+        tree.bind("<Double-1>", _open_selected)
+
+        def _load():
+            try:
+                self._on_crawler_log("info", f"🔍 正在按筛选条件预览：{keyword} {filters}")
+                ok, msg = self.crawler.start()
+                if not ok:
+                    self.root.after(0, lambda: status.config(text=f"启动失败：{msg}"))
+                    return
+                posts = self.crawler.search_notes(keyword, filters)
+                self.root.after(0, lambda: self._populate_filter_results(posts, tree, status))
+            except Exception as e:
+                self._on_crawler_log("err", f"筛选预览失败: {e}")
+                self.root.after(0, lambda: status.config(text=f"错误：{e}"))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _populate_filter_results(self, posts: List[Dict[str, Any]],
+                                 tree: ttk.Treeview, status: tk.Label):
+        for item in tree.get_children():
+            tree.delete(item)
+        if not posts:
+            status.config(text="未找到匹配结果")
+            return
+        for p in posts:
+            tree.insert("", "end", values=(
+                p.get("title", "")[:45],
+                p.get("user", "")[:18],
+                p.get("likes", ""),
+                p.get("comments", ""),
+                p.get("note_id", ""),
+            ))
+        status.config(text=f"共 {len(posts)} 条结果（双击可在浏览器中打开）")
+
+    def _on_analyze_page_filters(self):
+        def _analyze():
+            self._on_crawler_log("info", "🧠 正在实时分析当前网页的筛选面板...")
+            try:
+                result = self.crawler.analyze_page_filters()
+            except Exception as e:
+                result = {"error": str(e)}
+            self._on_crawler_log("info", f"页面筛选分析结果：{result}")
+            if result.get("error"):
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "分析失败", f"无法分析页面筛选：{result['error']}"))
+        threading.Thread(target=_analyze, daemon=True).start()
+
     def _on_start(self):
         # 收集参数
         self.config.set("mode", self.var_mode.get())
@@ -606,6 +774,8 @@ class App:
         self._on_cats_change()
         # 关键词
         self.config.set("search_keyword", self.entry_keyword.get().strip())
+        # 搜索筛选
+        self._on_filter_change()
         self.config.save()
 
         # 代理（同步到 config 和 AI 客户端）
@@ -718,17 +888,17 @@ class App:
     # ============== 拟人化 / 防封设置弹窗 ==============
     def _open_humanize_dialog(self):
         HZ_DEFAULTS = {
-            "enabled": True, "type_min_delay": 0.06, "type_max_delay": 0.20,
-            "type_pause_prob": 0.10, "type_pause_min": 0.30, "type_pause_max": 1.00,
-            "type_typo_rate": 0.05, "read_enabled": True, "read_per_char": 0.010,
-            "read_min": 1.5, "read_max": 5.0, "scroll_human": True,
-            "scroll_pause_prob": 0.30, "scroll_back_prob": 0.25,
-            "mouse_human_move": True, "mouse_overshoot_prob": 0.40, "hesitate_prob": 0.04,
-            "no_comment_rate": 12, "content_typo_rate": 0.15, "content_emoji_rate": 0.50,
-            "content_truncate_rate": 0.12, "glance_comments": True,
-            "skip_rate": 20, "long_break_prob": 0.07,
-            "long_break_min": 30, "long_break_max": 120, "session_action_cap": 35,
-            "session_break_min": 120, "session_break_max": 300, "randomize_order": True,
+            "enabled": True, "type_min_delay": 0.08, "type_max_delay": 0.35,
+            "type_pause_prob": 0.15, "type_pause_min": 0.50, "type_pause_max": 1.50,
+            "type_typo_rate": 0.08, "read_enabled": True, "read_per_char": 0.015,
+            "read_min": 2.5, "read_max": 8.0, "scroll_human": True,
+            "scroll_pause_prob": 0.40, "scroll_back_prob": 0.30,
+            "mouse_human_move": True, "mouse_overshoot_prob": 0.50, "hesitate_prob": 0.06,
+            "no_comment_rate": 25, "content_typo_rate": 0.20, "content_emoji_rate": 0.40,
+            "content_truncate_rate": 0.18, "glance_comments": True,
+            "skip_rate": 45, "long_break_prob": 0.15,
+            "long_break_min": 45, "long_break_max": 180, "session_action_cap": 20,
+            "session_break_min": 180, "session_break_max": 600, "randomize_order": True,
         }
         # 字段定义：(类型, key, 标签, min, max, step) 或 (分组标题, 标题)
         fields = [
@@ -874,6 +1044,120 @@ class App:
 
         ttk.Button(btn_row, text="恢复默认", command=reset_defaults).pack(side="left")
         ttk.Button(btn_row, text="取消", command=lambda: (canvas.unbind_all("<MouseWheel>"), dlg.destroy())).pack(side="right", padx=4)
+        ttk.Button(btn_row, text="保存", command=save).pack(side="right", padx=4)
+
+    # ============== 运营画像 / 每日风控弹窗 ==============
+    def _open_quota_dialog(self):
+        Q_DEFAULTS = {
+            "daily_quota_enabled": True,
+            "daily_like_limit": 15,
+            "daily_reply_limit": 12,
+            "active_hours_enabled": True,
+            "active_hours_start": "09:00",
+            "active_hours_end": "23:00",
+            "min_restart_interval_min": 30,
+        }
+        fields = [
+            ("group", "每日上限（跨重启累计）"),
+            ("bool", "daily_quota_enabled", "启用每日操作上限"),
+            ("num", "daily_like_limit", "每日点赞上限(次,0=不限)", 0, 200, 1),
+            ("num", "daily_reply_limit", "每日评论上限(次,0=不限)", 0, 200, 1),
+            ("group", "活跃时段"),
+            ("bool", "active_hours_enabled", "只在指定时段运行"),
+            ("text", "active_hours_start", "开始时间", 5),
+            ("text", "active_hours_end", "结束时间", 5),
+            ("group", "重启间隔"),
+            ("num", "min_restart_interval_min", "两次运行最小间隔(分钟,0=不限)", 0, 180, 5),
+        ]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("运营画像 / 风控设置")
+        dlg.configure(bg=COLORS["bg_panel"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("520x420")
+
+        tk.Label(dlg, text="平台会看「每日总操作量」和「活跃时间分布」。24 小时匀速在线是极强 bot 信号。",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"], font=FONTS["small"]).pack(
+            anchor="w", padx=14, pady=(10, 4))
+
+        body = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+
+        cur = dict(Q_DEFAULTS)
+        saved = self.config.data or {}
+        for k, v in Q_DEFAULTS.items():
+            cur[k] = saved.get(k, v)
+
+        vars_dict: dict = {}
+        row = 0
+        for spec in fields:
+            if spec[0] == "group":
+                tk.Label(body, text=spec[1], bg=COLORS["bg_panel"],
+                         fg=COLORS["fg_section"], font=FONTS["section"]).grid(
+                    row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            elif spec[0] == "bool":
+                key, label = spec[1], spec[2]
+                v = tk.BooleanVar(value=bool(cur.get(key, True)))
+                cb = ttk.Checkbutton(body, text=label, variable=v)
+                cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=(8, 0))
+                vars_dict[key] = v
+            elif spec[0] == "num":
+                key, label, lo, hi, step = spec[1], spec[2], spec[3], spec[4], spec[5]
+                tk.Label(body, text=label, bg=COLORS["bg_panel"],
+                         fg=COLORS["fg_text"], font=FONTS["normal"]).grid(
+                    row=row, column=0, sticky="w", padx=(8, 0))
+                val = cur.get(key, 0)
+                v = tk.StringVar(value=str(val))
+                sp = tk.Spinbox(body, from_=lo, to=hi, increment=step, width=10,
+                                textvariable=v, bg=COLORS["bg_input"], fg=COLORS["fg_text"],
+                                buttonbackground=COLORS["btn_bg"], font=FONTS["normal"])
+                sp.grid(row=row, column=1, sticky="w", padx=(10, 0))
+                vars_dict[key] = v
+            elif spec[0] == "text":
+                key, label, width = spec[1], spec[2], spec[3]
+                tk.Label(body, text=label, bg=COLORS["bg_panel"],
+                         fg=COLORS["fg_text"], font=FONTS["normal"]).grid(
+                    row=row, column=0, sticky="w", padx=(8, 0))
+                v = tk.StringVar(value=str(cur.get(key, "")))
+                e = ttk.Entry(body, textvariable=v, width=width)
+                e.grid(row=row, column=1, sticky="w", padx=(10, 0))
+                vars_dict[key] = v
+            row += 1
+
+        def _coerce(key, raw):
+            try:
+                f = float(raw)
+                if f == int(f):
+                    return int(f)
+                return f
+            except Exception:
+                return Q_DEFAULTS.get(key, 0)
+
+        def save():
+            new_cfg = {}
+            for key, var in vars_dict.items():
+                if isinstance(var, tk.BooleanVar):
+                    new_cfg[key] = bool(var.get())
+                else:
+                    new_cfg[key] = _coerce(key, var.get())
+            for k, v in new_cfg.items():
+                self.config.set(k, v)
+            self.config.save()
+            self._append_log("ok", "🕐 运营画像设置已保存（重启任务后生效）")
+            dlg.destroy()
+
+        def reset_defaults():
+            for k, v in Q_DEFAULTS.items():
+                self.config.set(k, v)
+            self.config.save()
+            self._append_log("ok", "🕐 已恢复运营画像默认设置")
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        btn_row.pack(fill="x", padx=14, pady=(0, 10))
+        ttk.Button(btn_row, text="恢复默认", command=reset_defaults).pack(side="left")
+        ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side="right", padx=4)
         ttk.Button(btn_row, text="保存", command=save).pack(side="right", padx=4)
 
     # ============== API 配置弹窗 ==============
