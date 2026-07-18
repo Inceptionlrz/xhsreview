@@ -11,6 +11,11 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from typing import Dict, Any, Optional, List
 
+from src.license import (
+    get_machine_code, verify_license, load_saved_code, save_code,
+    clear_saved_code, grouped_display, LicenseInfo,
+)  # 激活码 / 机器码授权
+
 # 使脚本与包都能 import
 if __package__ in (None, ""):
     import sys
@@ -139,16 +144,20 @@ class App:
         s.configure("TButton", background=COLORS["btn_bg"], foreground=COLORS["btn_fg"],
                     font=FONTS["label"], padding=(12, 6), borderwidth=0)
         s.map("TButton",
-              background=[("active", COLORS["btn_hover"]), ("disabled", "#555")],
+              background=[("pressed", COLORS["btn_pressed"]),
+                         ("active", COLORS["btn_hover"]),
+                         ("disabled", "#555")],
               foreground=[("disabled", "#888")])
 
         s.configure("Start.TButton", background=COLORS["btn_start"], foreground="#fff",
                     font=FONTS["label"], padding=(18, 6))
-        s.map("Start.TButton", background=[("active", "#3D7EE6")])
+        s.map("Start.TButton", background=[("pressed", COLORS["btn_start_pressed"]),
+                                          ("active", "#3D7EE6")])
 
         s.configure("Stop.TButton", background=COLORS["btn_stop"], foreground="#fff",
                     font=FONTS["label"], padding=(18, 6))
-        s.map("Stop.TButton", background=[("active", "#F07070")])
+        s.map("Stop.TButton", background=[("pressed", COLORS["btn_stop_pressed"]),
+                                         ("active", "#F07070")])
 
         s.configure("TLabelframe", background=COLORS["bg_panel"], foreground=COLORS["fg_section"],
                     bordercolor=COLORS["border"], relief="flat")
@@ -172,19 +181,19 @@ class App:
         self.lbl_username = tk.Label(user_inner, text="未登录", bg=COLORS["bg_panel"],
                                      fg=COLORS["fg_value"], font=FONTS["value"])
         self.lbl_username.pack(side="left", padx=(2, 18))
-        tk.Label(user_inner, text="等级：", bg=COLORS["bg_panel"], fg=COLORS["fg_text"],
+        tk.Label(user_inner, text="授权：", bg=COLORS["bg_panel"], fg=COLORS["fg_text"],
                  font=FONTS["normal"]).pack(side="left")
         self.lbl_level = tk.Label(user_inner, text="-", bg=COLORS["bg_panel"],
                                   fg=COLORS["fg_value"], font=FONTS["value"])
         self.lbl_level.pack(side="left", padx=(2, 18))
-        tk.Label(user_inner, text="下一级：", bg=COLORS["bg_panel"], fg=COLORS["fg_text"],
-                 font=FONTS["normal"]).pack(side="left")
-        self.lbl_next = tk.Label(user_inner, text="-", bg=COLORS["bg_panel"],
-                                 fg=COLORS["fg_value"], font=FONTS["value"])
-        self.lbl_next.pack(side="left", padx=(2, 18))
+        ttk.Button(user_inner, text="激活", width=5,
+                   command=self._open_activate_dialog).pack(side="left", padx=(0, 10))
         self.lbl_user_state = tk.Label(user_inner, text="● 离线", bg=COLORS["bg_panel"],
                                        fg=COLORS["fg_warn"], font=FONTS["normal"])
         self.lbl_user_state.pack(side="right")
+
+        # 启动后刷新授权状态（读取已保存激活码）
+        self._refresh_license()
 
         # ============== 运行模式 ==============
         mode_frame = tk.LabelFrame(self.root, text="  运行模式  ", bg=COLORS["bg_panel"],
@@ -457,6 +466,15 @@ class App:
                  bg=COLORS["bg_panel"], fg=COLORS["fg_sub"],
                  font=FONTS["small"]).grid(row=2, column=4, columnspan=11, sticky="w", padx=(10, 0), pady=(4, 0))
 
+        # 养号模式开关
+        self.var_nurture = tk.BooleanVar(value=bool(self.config.get("nurture_mode", False)))
+        ttk.Checkbutton(ai, text="🌱 养号模式", variable=self.var_nurture).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        tk.Label(ai, text="（极低频 · 只看不评 · 随机长休息，账号被风控后做冷启动养号用）",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"],
+                 font=FONTS["small"]).grid(row=3, column=4, columnspan=11, sticky="w",
+                                           padx=(10, 0), pady=(4, 0))
+
         # ============== 统计 ==============
         stat_frame = tk.LabelFrame(self.root, text="  本次统计  ", bg=COLORS["bg_panel"],
                                    fg=COLORS["fg_section"], font=FONTS["section"],
@@ -482,6 +500,57 @@ class App:
             v = tk.Label(cell, text="0", bg=COLORS["bg_panel"], fg=color, font=FONTS["value"])
             v.pack(side="left", padx=2)
             self.stat_labels[key] = v
+
+    # ============== 交互增强（基于 emil-design-eng / apple-design）==============
+    def _position_dialog_near_cursor(self, dlg, offset_y=18):
+        """弹窗定位到鼠标当前位置附近（origin-aware）。
+        参考 emil-design-eng: popovers should scale/originate from their trigger；
+        apple-design §7: spatial consistency — 弹窗从用户操作位置出现，而非默认居中。
+        弹窗出现在光标右下方，并做屏幕边界修正，避免遮挡或超出。"""
+        dlg.update_idletasks()
+        pw, ph = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        mx = dlg.winfo_pointerx()
+        my = dlg.winfo_pointery()
+        x = mx + 16
+        y = my + offset_y
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        if x + pw > sw - 8:
+            x = mx - pw - 16
+        if y + ph > sh - 40:
+            y = my - ph - offset_y
+        if x < 8:
+            x = 8
+        if y < 8:
+            y = 8
+        dlg.geometry(f"+{x}+{y}")
+
+    def _fade_in_dialog(self, dlg, steps=8, delay=12):
+        """弹窗淡入：alpha 从 0 渐变到 1。
+        参考 apple-design §7: 空间一致性 + 进入用 ease-out（即时起步）；
+        emil-design-eng: 进入动画 150-250ms，禁用 ease-in。
+        Windows 平台支持 -alpha 属性，失败则静默跳过（不影响功能）。"""
+        try:
+            dlg.attributes("-alpha", 0.0)
+            progress = [0.0]
+
+            def step():
+                # ease-out 风格：前几步跨度大，给出即时响应感
+                progress[0] += 1.0 / steps
+                if progress[0] >= 1.0:
+                    dlg.attributes("-alpha", 1.0)
+                    return
+                dlg.attributes("-alpha", progress[0])
+                dlg.after(delay, step)
+
+            dlg.after(10, step)
+        except Exception:
+            pass
+
+    def _style_dialog(self, dlg):
+        """统一弹窗样式 + 定位 + 淡入。所有业务弹窗调用此方法获得一致的交互。"""
+        self._position_dialog_near_cursor(dlg)
+        self._fade_in_dialog(dlg)
 
     # ============== 行为回调 ==============
     def _on_crawler_log(self, level: str, msg: str):
@@ -673,6 +742,7 @@ class App:
         dlg.configure(bg=COLORS["bg_panel"])
         dlg.geometry("760x520")
         dlg.transient(self.root)
+        self._style_dialog(dlg)
 
         top = tk.Frame(dlg, bg=COLORS["bg_panel"])
         top.pack(fill="x", padx=10, pady=(10, 6))
@@ -758,7 +828,113 @@ class App:
                     "分析失败", f"无法分析页面筛选：{result['error']}"))
         threading.Thread(target=_analyze, daemon=True).start()
 
+    def _refresh_license(self) -> LicenseInfo:
+        """读取并校验已保存激活码，刷新 GUI 授权标签，返回状态。"""
+        code = load_saved_code()
+        info = verify_license(code) if code else LicenseInfo(valid=False, message="未激活")
+        self.license_info = info
+        if info.valid:
+            self.lbl_level.config(text=info.status_text(), fg=COLORS["fg_ok"])
+        else:
+            # 显示具体原因（不匹配 / 过期 / 格式错误），便于排查
+            reason = info.message or "未知"
+            # 截断过长信息
+            short = reason if len(reason) <= 16 else reason[:14] + ".."
+            self.lbl_level.config(text=short, fg=COLORS["fg_warn"])
+        return info
+
+    def _open_activate_dialog(self):
+        """激活对话框：展示本机机器码（用于申请激活码）+ 输入激活码。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("软件激活")
+        dlg.geometry("460x300")
+        dlg.configure(bg=COLORS["bg_panel"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self._style_dialog(dlg)
+
+        tk.Label(dlg, text="🔐 软件激活", font=("", 14, "bold"),
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_text"]).pack(pady=(16, 6))
+
+        # 本机机器码（申请激活码用）
+        mc = get_machine_code()
+        mc_frame = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        mc_frame.pack(fill="x", padx=24, pady=(4, 10))
+        tk.Label(mc_frame, text="本机机器码：", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_sub"], font=("", 10)).pack(side="left")
+        mc_var = tk.StringVar(value=mc)
+        mc_entry = tk.Entry(mc_frame, textvariable=mc_var, state="readonly",
+                            font=("Consolas", 10), width=22,
+                            readonlybackground=COLORS["bg_panel"],
+                            fg=COLORS["fg_value"])
+        mc_entry.pack(side="left", padx=(4, 6))
+
+        def on_copy_mc():
+            try:
+                dlg.clipboard_clear()
+                dlg.clipboard_append(mc)
+                btn_mc.config(text="已复制")
+                dlg.after(1200, lambda: btn_mc.config(text="复制"))
+            except Exception:
+                pass
+
+        btn_mc = ttk.Button(mc_frame, text="复制", width=6, command=on_copy_mc)
+        btn_mc.pack(side="left")
+
+        tk.Label(dlg, text="（将机器码发给开发者，获取对应档位激活码）",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_sub"], font=("", 9)).pack()
+
+        # 激活码输入
+        tk.Label(dlg, text="激活码：", bg=COLORS["bg_panel"],
+                 fg=COLORS["fg_text"], font=("", 10)).pack(pady=(10, 2))
+        code_var = tk.StringVar()
+        code_entry = tk.Entry(dlg, textvariable=code_var, font=("Consolas", 10),
+                              width=46, fg=COLORS["fg_value"])
+        code_entry.pack(padx=24)
+        code_entry.focus_set()
+
+        msg_var = tk.StringVar()
+        msg_label = tk.Label(dlg, textvariable=msg_var, bg=COLORS["bg_panel"],
+                             fg=COLORS["fg_warn"], font=("", 9))
+        msg_label.pack(pady=(6, 0))
+
+        def on_activate():
+            raw = code_var.get().strip()
+            if not raw:
+                msg_var.set("请输入激活码")
+                return
+            info = verify_license(raw)
+            if not info.valid:
+                msg_var.set("激活失败：" + info.message)
+                return
+            if save_code(raw):
+                self._refresh_license()
+                messagebox.showinfo("激活成功",
+                                    f"已激活：{info.status_text()}", parent=dlg)
+                dlg.destroy()
+            else:
+                msg_var.set("激活码有效，但保存到本地失败（权限不足）")
+
+        def on_cancel():
+            dlg.destroy()
+
+        btn_frame = tk.Frame(dlg, bg=COLORS["bg_panel"])
+        btn_frame.pack(pady=(14, 4))
+        ttk.Button(btn_frame, text="激活", width=10, command=on_activate).pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="取消", width=10, command=on_cancel).pack(side="left", padx=8)
+
+        dlg.update_idletasks()
+        dlg.geometry("")
+        dlg.geometry(f"+{(dlg.winfo_screenwidth() - dlg.winfo_width()) // 2}"
+                     f"+{(dlg.winfo_screenheight() - dlg.winfo_height()) // 2}")
+
     def _on_start(self):
+        # 授权校验：未激活 / 过期 / 机器不符 → 拦截
+        lic = self._refresh_license()
+        if not lic.valid:
+            messagebox.showerror("未激活", lic.message or "请先在「激活」中输入有效激活码")
+            return
+
         # 收集参数
         self.config.set("mode", self.var_mode.get())
         self.config.set("post_limit", int(self.spin_count.get()))
@@ -771,6 +947,11 @@ class App:
         self.config.set("enable_wait", bool(self.var_wait.get()))
         self.config.set("wait_min", int(self.spin_wmin.get()))
         self.config.set("wait_max", int(self.spin_wmax.get()))
+        self.config.set("nurture_mode", bool(self.var_nurture.get()))
+        if bool(self.var_nurture.get()):
+            # 养号模式强制含极低频点赞，避免 GUI 勾选状态与运行行为不一致
+            self.config.set("auto_like", True)
+            self.var_like.set(True)
         self._on_cats_change()
         # 关键词
         self.config.set("search_keyword", self.entry_keyword.get().strip())
@@ -816,6 +997,11 @@ class App:
                 self._on_crawler_log("warn", "未检测到登录状态，请在浏览器中扫码登录小红书")
                 self._on_crawler_log("info", "扫码登录后，点击「已登录」按钮继续")
                 self._show_login_prompt()
+            elif self.crawler and not self.crawler.use_mock:
+                # 已登录，刷新用户名到界面
+                name = self.crawler.user_name
+                if name:
+                    self.lbl_username.config(text=name, fg=COLORS["fg_text"])
         else:
             messagebox.showerror("启动失败", msg)
 
@@ -827,18 +1013,22 @@ class App:
         dlg.configure(bg=COLORS["bg_panel"])
         dlg.transient(self.root)
         dlg.grab_set()
+        self._style_dialog(dlg)
 
         tk.Label(dlg, text="🔑 请在小红书浏览器中扫码登录",
                  font=("", 13, "bold"), bg=COLORS["bg_panel"],
                  fg=COLORS["fg_text"]).pack(pady=(20, 8))
         tk.Label(dlg, text="登录后点击下方按钮重新检测登录状态",
                  font=("", 10), bg=COLORS["bg_panel"],
-                 fg=COLORS["fg_dim"]).pack(pady=(0, 16))
+                 fg=COLORS["fg_sub"]).pack(pady=(0, 16))
 
         def on_recheck():
             if self.crawler and not self.crawler.use_mock:
                 logged_in = self.crawler.recheck_login()
                 if logged_in:
+                    name = self.crawler.user_name
+                    if name:
+                        self.lbl_username.config(text=name, fg=COLORS["fg_text"])
                     self._on_crawler_log("ok", "检测到已登录状态")
                     dlg.destroy()
                 else:
@@ -894,7 +1084,9 @@ class App:
             "read_min": 2.5, "read_max": 8.0, "scroll_human": True,
             "scroll_pause_prob": 0.40, "scroll_back_prob": 0.30,
             "mouse_human_move": True, "mouse_overshoot_prob": 0.50, "hesitate_prob": 0.06,
-            "no_comment_rate": 25, "content_typo_rate": 0.20, "content_emoji_rate": 0.40,
+            "no_comment_rate": 25, "generic_reply_rate": 45, "content_min_post_len": 25,
+            "content_vary_voice": True, "persona_rotate": True,
+            "content_typo_rate": 0.20, "content_emoji_rate": 0.40,
             "content_truncate_rate": 0.18, "glance_comments": True,
             "skip_rate": 45, "long_break_prob": 0.15,
             "long_break_min": 45, "long_break_max": 180, "session_action_cap": 20,
@@ -925,6 +1117,10 @@ class App:
             ("num", "hesitate_prob", "犹豫了没点赞概率(0~1)", 0.0, 1.0, 0.01),
             ("group", "AI 回复内容拟人（防 AI 味 / 人工审核）"),
             ("num", "no_comment_rate", "看了但不评论率(%)", 0, 100, 1),
+            ("num", "generic_reply_rate", "通用反应率(%)——直接发口语反应跳过AI", 0, 100, 1),
+            ("num", "content_min_post_len", "正文过短强制通用反应(字数,0=关)", 0, 200, 1),
+            ("bool", "content_vary_voice", "每次随机切换语气(情绪/反问/含糊/共情)"),
+            ("bool", "persona_rotate", "从人设池随机轮换(打破单一声音指纹)"),
             ("num", "content_typo_rate", "偶发错别字概率(0~1)", 0.0, 1.0, 0.01),
             ("num", "content_emoji_rate", "追加 emoji 概率(0~1)", 0.0, 1.0, 0.01),
             ("num", "content_truncate_rate", "只保留前半句概率(0~1)", 0.0, 1.0, 0.01),
@@ -948,6 +1144,7 @@ class App:
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.geometry("620x560")
+        self._style_dialog(dlg)
 
         # 顶部说明
         tk.Label(dlg, text="这些设置让自动化行为更接近真人，降低被小红书风控识别的概率。",
@@ -1076,6 +1273,7 @@ class App:
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.geometry("520x420")
+        self._style_dialog(dlg)
 
         tk.Label(dlg, text="平台会看「每日总操作量」和「活跃时间分布」。24 小时匀速在线是极强 bot 信号。",
                  bg=COLORS["bg_panel"], fg=COLORS["fg_sub"], font=FONTS["small"]).pack(
@@ -1168,6 +1366,7 @@ class App:
         dlg.geometry("560x460")
         dlg.transient(self.root)
         dlg.grab_set()
+        self._style_dialog(dlg)
 
         body = tk.Frame(dlg, bg=COLORS["bg_panel"])
         body.pack(fill="both", expand=True, padx=16, pady=14)
@@ -1185,10 +1384,20 @@ class App:
         e_url = row("API URL：", self.config.get("api_base_url", "https://api.anthropic.com"), row_idx=0)
         e_key = row("API Key：", self.config.get("api_key", ""), show="*", row_idx=1)
         e_model = row("Model：", self.config.get("api_model", "claude-3-5-sonnet-20241022"), row_idx=2)
-        e_persona = row("人设：", self.config.get("api_persona", "友好、有趣的小红书用户"), row_idx=3)
-        e_proxy = row("代理：", self.config.get("proxy", ""), row_idx=4)
+        e_persona = row("默认人设：", self.config.get("api_persona", "友好、有趣的小红书用户"), row_idx=3)
+        # 人设池（多行）：运营时随机轮换，打破「单一完美声音」指纹
+        tk.Label(body, text="人设池（每行一个，运营时随机轮换；留空则只用上面的默认人设）：",
+                 bg=COLORS["bg_panel"], fg=COLORS["fg_text"], font=FONTS["normal"]).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        e_pool = tk.Text(body, height=4, width=52, bg=COLORS["bg_input"], fg=COLORS["fg_text"],
+                         font=FONTS["normal"], relief="flat",
+                         highlightbackground=COLORS["border"], highlightthickness=1)
+        pool_val = self.config.get("persona_pool") or []
+        e_pool.insert("1.0", "\n".join(pool_val) if isinstance(pool_val, list) else str(pool_val))
+        e_pool.grid(row=5, column=0, columnspan=2, sticky="we", pady=(2, 6))
+        e_proxy = row("代理：", self.config.get("proxy", ""), row_idx=6)
         tk.Label(body, text="（留空直连，格式 127.0.0.1:7897）", bg=COLORS["bg_panel"],
-                 fg=COLORS["fg_sub"], font=FONTS["small"]).grid(row=4, column=1, sticky="w", padx=(10, 0), pady=(0, 6))
+                 fg=COLORS["fg_sub"], font=FONTS["small"]).grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(0, 6))
 
         # 高级
         adv = tk.LabelFrame(body, text="  高级  ", bg=COLORS["bg_panel"], fg=COLORS["fg_section"],
@@ -1230,6 +1439,9 @@ class App:
             self.config.set("api_key", e_key.get().strip())
             self.config.set("api_model", e_model.get().strip() or "claude-3-5-sonnet-20241022")
             self.config.set("api_persona", e_persona.get().strip())
+            pool_raw = e_pool.get("1.0", "end").strip()
+            pool_list = [ln.strip() for ln in pool_raw.splitlines() if ln.strip()]
+            self.config.set("persona_pool", pool_list)
             self.config.set("proxy", e_proxy.get().strip())
             self.config.set("api_max_tokens", int(e_max.get()))
             self.config.set("api_temperature", float(e_temp.get()))

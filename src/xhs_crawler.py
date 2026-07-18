@@ -319,6 +319,8 @@ class XhsCrawler:
         self._started = False
         self._logged_in = False
         self._logged_in_lock = threading.Lock()
+        self._user_name = ""          # 登录后提取的用户昵称
+        self._user_name_lock = threading.Lock()
 
         # note_id → 完整 URL（含 xsec_token 等查询参数）的缓存
         # 在 _parse_card 中填充，在 _do_open_note/_do_like/_do_post_comment 中使用
@@ -490,6 +492,11 @@ class XhsCrawler:
     def is_logged_in(self) -> bool:
         with self._logged_in_lock:
             return self._logged_in
+
+    @property
+    def user_name(self) -> str:
+        with self._user_name_lock:
+            return self._user_name or ""
 
     def recheck_login(self) -> bool:
         """重新检测登录状态（用户扫码后调用）"""
@@ -884,18 +891,21 @@ class XhsCrawler:
 
     # ---------------- Worker 内部：Playwright 操作 ----------------
     def _check_login(self, page: Page) -> bool:
-        """检测登录状态
+        """检测登录状态，同时提取用户昵称
 
         策略（三重验证，任一通过即认为已登录）：
         1. Cookie: web_session 存在且非空（最可靠）
         2. DOM: 侧边栏有用户头像（.side-bar 内有 img/avatar）
         3. DOM: 页面有 .user-info 且没有独立的登录弹窗
         """
+        nick_text = ""
         try:
             # 策略 1: Cookie 检测（最可靠）
             cookies = page.context.cookies()
             for c in cookies:
                 if c.get("name") == "web_session" and c.get("value") and len(c["value"]) > 10:
+                    nick_text = self._extract_nick(page)
+                    self._set_user_name(nick_text)
                     return True
 
             # 策略 2: 侧边栏用户头像
@@ -904,6 +914,8 @@ class XhsCrawler:
                 ".side-bar .user .avatar, .login-btn .avatar"
             )
             if avatar:
+                nick_text = self._extract_nick(page)
+                self._set_user_name(nick_text)
                 return True
 
             # 策略 3: 有 user nickname 元素且无登录弹窗
@@ -913,11 +925,40 @@ class XhsCrawler:
                 ".qrcode-container, [class*='qrcode']"
             )
             if nick and not login_modal:
+                try:
+                    nick_text = (nick.inner_text() or "").strip()
+                except Exception:
+                    pass
+                self._set_user_name(nick_text)
                 return True
 
             return False
         except Exception:
             return False
+
+    def _extract_nick(self, page: Page) -> str:
+        """从页面 DOM 尝试提取用户昵称"""
+        for sel in (
+            ".side-bar .user-nickname",
+            ".side-bar .user .name",
+            ".user-info .username",
+            ".author .name",
+            ".author-wrapper .name",
+        ):
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    t = (el.inner_text() or "").strip()
+                    if t:
+                        return t
+            except Exception:
+                continue
+        return ""
+
+    def _set_user_name(self, name: str):
+        with self._user_name_lock:
+            if name and name != self._user_name:
+                self._user_name = name
 
     def _navigate_with_retry(self, page: Page, url: str, retries: int = 2):
         last_err = None

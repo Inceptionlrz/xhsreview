@@ -3,6 +3,13 @@
   "api_key": "YOUR_API_KEY_HERE",
   "api_model": "claude-3-5-sonnet-20241022",
   "api_persona": "友好、有趣、真实的小红书用户",
+  "persona_pool": [
+    "一个爱逛小红书的普通女生，说话随意、爱用表情",
+    "有点社恐但热心的大学生，评论常常很简短",
+    "刚工作不久的打工人，偶尔吐槽偶尔种草",
+    "爱蹲好物的懒人党，看到有用的就马住",
+    "话不多但会认真看完帖子的路人"
+  ],
   "api_max_tokens": 256,
   "api_temperature": 0.85,
   "proxy": "",
@@ -54,6 +61,10 @@
     "mouse_overshoot_prob": 0.50,
     "hesitate_prob": 0.06,
     "no_comment_rate": 25,
+    "generic_reply_rate": 45,
+    "content_min_post_len": 25,
+    "content_vary_voice": true,
+    "persona_rotate": true,
     "content_typo_rate": 0.20,
     "content_emoji_rate": 0.40,
     "content_truncate_rate": 0.18,
@@ -66,6 +77,21 @@
     "session_break_min": 180,
     "session_break_max": 600,
     "randomize_order": true
+  },
+  "nurture_mode": false,
+  "nurture": {
+    "auto_reply": false,
+    "auto_like": true,
+    "like_rate": 3,
+    "skip_rate": 85,
+    "wait_min": 8,
+    "wait_max": 20,
+    "long_break_prob": 0.35,
+    "long_break_min": 120,
+    "long_break_max": 420,
+    "session_action_cap": 4,
+    "daily_like_limit": 3,
+    "daily_reply_limit": 0
   },
   "categories": {
     "推荐": true,

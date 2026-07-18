@@ -6,6 +6,8 @@ __pycache__/
 
 # ===== Secrets / local config (contains real API key!) =====
 config/
+# 激活码私钥（仅开发者侧，严禁提交！公钥已内置 src/license.py）
+scripts/license_private_key.pem
 
 # ===== Runtime artifacts =====
 logs/

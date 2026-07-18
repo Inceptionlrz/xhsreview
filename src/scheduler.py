@@ -85,8 +85,42 @@ class Scheduler:
         return self._state["running"]
 
     # ---------------- 主循环 ----------------
+    def _resolve_config(self) -> Dict[str, Any]:
+        """合并「养号模式」覆盖，返回 config dict。
+
+        养号模式关闭时直接返回原 config（零副作用）；开启时返回新 dict，
+        仅作用于本次运行的 Scheduler 实例，不回写外部传入的 config。
+        用于账号被平台判定为 AI 运营后的「冷启动」：极低频、只看不评、随机长休息。
+        """
+        if not self.config.get("nurture_mode", False):
+            return self.config
+        cfg = dict(self.config)
+        nz = cfg.get("nurture", {}) or {}
+        # 顶层标量覆盖
+        for k in ("auto_reply", "auto_like", "like_rate", "wait_min", "wait_max",
+                  "daily_like_limit", "daily_reply_limit"):
+            if k in nz:
+                cfg[k] = nz[k]
+        # humanize 嵌套覆盖（skip / 长休息 / 会话上限）
+        hz = dict(cfg.get("humanize", {}) or {})
+        for k in ("skip_rate", "long_break_prob", "long_break_min",
+                  "long_break_max", "session_action_cap"):
+            if k in nz:
+                hz[k] = nz[k]
+        cfg["humanize"] = hz
+        # 双保险：养号期间绝不评论
+        cfg["auto_reply"] = False
+        cfg["daily_reply_limit"] = 0
+        return cfg
+
     def _run(self):
         try:
+            # 养号模式：用覆盖后的配置运行（仅影响本实例）
+            self.config = self._resolve_config()
+            if self.config.get("nurture_mode", False):
+                self._log("warn", "🌱 养号模式已启用：极低频 · 只看不评 · 随机长休息")
+                self._log("info", "🌱 养号 = 每日≤3次点赞 + 纯浏览跳过(85%) + 帖子间等待8~20秒 "
+                                  "+ 频繁长休息；绝不评论。处罚期结束前请勿关闭本模式")
             # 启动前先做配额 / 时段检查
             can_run, reason = self._quota.check(self.config)
             if not can_run:
@@ -238,35 +272,61 @@ class Scheduler:
                             if not (title or content):
                                 continue
                             # 偶发「看了但不评论」（更自然，且省一次 AI 调用）
-                            no_comment_rate = int(hz.get("no_comment_rate", 12)) if hz_enabled else 0
+                            no_comment_rate = int(hz.get("no_comment_rate", 25)) if hz_enabled else 0
                             if no_comment_rate > 0 and random.randint(1, 100) <= no_comment_rate:
                                 self._log("info", f"🙊 看了但没评论: {title[:30]}")
                                 continue
-                            self._log("info", f"🧠 正在生成回复: {title[:30]}")
-                            reply = self.ai.generate_reply(
-                                post_title=title,
-                                post_content=content,
-                                persona=self.config.get("api_persona", "友好、有趣的小红书用户"),
-                                max_tokens=int(self.config.get("api_max_tokens", 256)),
-                                temperature=float(self.config.get("api_temperature", 0.85)),
-                            )
-                            if not reply:
-                                self._log("err", f"AI 生成失败: {self.ai.last_error or '未知'}")
-                                self._state["errors"] += 1
+
+                            # 人设轮换：从 pool 随机选，打破「单一完美声音」指纹
+                            persona = self.config.get("api_persona", "友好、有趣的小红书用户")
+                            pool = self.config.get("persona_pool") or []
+                            if hz_enabled and hz.get("persona_rotate", True) and isinstance(pool, list) and pool:
+                                persona = random.choice(pool)
+
+                            # 通用反应闸门：一定概率直接发真人口语反应（跳过 AI，最抗 AI 检测）
+                            # 帖子正文过短也强制走通用反应（没料可评，硬评反而露馅）
+                            generic_rate = int(hz.get("generic_reply_rate", 45)) if hz_enabled else 0
+                            min_len = int(hz.get("content_min_post_len", 25)) if hz_enabled else 0
+                            use_generic = (generic_rate > 0 and random.randint(1, 100) <= generic_rate) \
+                                or (min_len > 0 and len(content or "") < min_len)
+
+                            if use_generic:
+                                reply = random.choice(AnthropicClient.GENERIC_REACTIONS)
+                                if random.random() < 0.30:  # 偶发补一个 emoji，更自然
+                                    reply = reply.rstrip("。.!！?？~ ") + random.choice(
+                                        ["😂", "✨", "👍", "🔥", "🥺", "💯"])
+                                self._log("info", f"💬 通用反应: {reply[:30]}")
                             else:
+                                self._log("info", f"🧠 正在生成回复: {title[:30]}")
+                                style_hint = random.choice(
+                                    ["react", "question", "vague", "empathize", "onpoint"]) \
+                                    if (hz_enabled and hz.get("content_vary_voice", True)) else ""
+                                reply = self.ai.generate_reply(
+                                    post_title=title,
+                                    post_content=content,
+                                    persona=persona,
+                                    max_tokens=int(self.config.get("api_max_tokens", 256)),
+                                    temperature=float(self.config.get("api_temperature", 0.85)),
+                                    style_hint=style_hint,
+                                )
+                                if not reply:
+                                    self._log("err", f"AI 生成失败: {self.ai.last_error or '未知'}")
+                                    self._state["errors"] += 1
+                                    continue
                                 # 内容层拟人后处理（防 AI 味 / 人工审核）
                                 reply = self.ai.humanize_reply(reply, hz if hz_enabled else {})
-                                ok, msg = self.crawler.post_comment(
-                                    note_id, reply, context_text=f"{title}\n{content}")
-                                if ok:
-                                    self._state["replied"] += 1
-                                    self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
-                                    self._session_actions += 1
-                                    self._quota.add_reply()
-                                else:
-                                    self._log("err", f"回复失败: {msg}")
-                                    self._state["errors"] += 1
-                                self._publish_state()
+
+                            ok, msg = self.crawler.post_comment(
+                                note_id, reply, context_text=f"{title}\n{content}")
+                            if ok:
+                                self._state["replied"] += 1
+                                self._log("ok", f"💬 已回复({self._state['replied']}次): {reply[:60]}")
+                                self._session_actions += 1
+                                self._quota.add_reply()
+                            else:
+                                self._log("err", f"回复失败: {msg}")
+                                self._state["errors"] += 1
+                            self._publish_state()
 
                     # 会话安全上限（累计操作达上限强制长休）& 偶发长休息
                     self._maybe_session_break(hz, hz_enabled)

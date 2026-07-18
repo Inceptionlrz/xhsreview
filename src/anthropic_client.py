@@ -115,24 +115,51 @@ class AnthropicClient:
         except Exception as e:
             return False, f"连接失败: {e}"
 
+    # 通用反应池：真人评论里占比极高、几乎不可能被判定为 AI 的低信息量口语反应。
+    # 调度层会按 generic_reply_rate 概率直接发其中一条（跳过 AI 生成）。
+    GENERIC_REACTIONS = [
+        "前排～", "沙发！", "蹲一个", "收藏了", "学到了", "马住", "码住",
+        "楼主好厉害", "绝了", "太对了", "哈哈哈", "蹲蹲", "想看后续",
+        "求更", "笑死", "这也太真实了", "抱走", "感谢分享", "路过支持了",
+        "卧槽牛", "我裂开", "好家伙", "冲冲冲", "坐等", "默默马住",
+        "已三连", "楼主继续啊", "蹲一个教程", "太需要了", "mark",
+    ]
+
     def generate_reply(self, post_title: str, post_content: str,
                        persona: str = "友好、有趣的小红书用户",
                        max_tokens: int = 256,
-                       temperature: float = 0.85) -> Optional[str]:
-        """根据帖子内容生成回复"""
+                       temperature: float = 0.85,
+                       style_hint: str = "") -> Optional[str]:
+        """根据帖子内容生成回复。
+
+        style_hint: 由调度层随机注入的语气方向，用于打破「每次都写切题好评」的单一结构指纹。
+        可选值：react(纯情绪) / question(反问) / vague(含糊) / empathize(共情) / onpoint(切题)
+        """
         with self._lock:
             self.total_calls += 1
+
+        # 每种语气方向给一条不同的「写作约束」，避免输出结构雷同
+        style_rules = {
+            "react": "这次只表达一下情绪/态度就好，不要给信息、不要给建议，像随手敲了一句。",
+            "question": "这次用一句反问或好奇的提问来回应，不急着给结论，可以带点疑惑。",
+            "vague": "这次说得含糊随意一点，不必句句切题，可以跑一点点题或只说感受。",
+            "empathize": "这次重点表达共鸣/理解/陪伴，不输出干货，像朋友在旁边附和。",
+            "onpoint": "这次可以就帖子内容说点相关的看法，但依然口语、简短、不教条。",
+        }
+        style_text = style_rules.get(style_hint, "语气自然随意即可，不必每次都切题或给建议。")
 
         system_prompt = (
             f"你是一个{persona}。你会针对小红书上的帖子写一条像真人随手发的短回复。\n"
             f"语气要求（非常重要）：\n"
             f"1. 必须口语化、接地气，像随手刷到顺手评论，不要用书面语、不要用「首先/其次/总之」这类结构；\n"
-            f"2. 长度 1 句话为主，偶尔 2 句，多数在 10-40 字之间，不要太长太工整；\n"
-            f"3. 可以带点个人情绪（赞同/惊讶/共鸣/调侃/疑惑都行），但不要每句都热情洋溢；\n"
-            f"4. 允许偶尔用网络用语、缩写、语气词（如 哈哈、绝了、这也太、求链接），偶尔漏个标点或用个～也没事；\n"
-            f"5. 不要重复原帖内容，不要说教，更不要说自己是 AI 或助手；\n"
-            f"6. 偶尔（约两成）也可以只回一两个词或一个 emoji 表达情绪，不用硬凑句子；\n"
-            f"7. 直接输出回复内容，不要任何前缀、引号或解释。"
+            f"2. 长度 1 句话为主，偶尔 2 句，多数在 8-35 字之间，不要太长太工整；\n"
+            f"3. 不要每次都给出有用的信息或建议——很多时候真人只是表达一下情绪、随便说两句、或者反问一句；\n"
+            f"4. 可以带点个人情绪（赞同/惊讶/共鸣/调侃/疑惑都行），但不要每句都热情洋溢；\n"
+            f"5. 允许偶尔用网络用语、缩写、语气词（如 哈哈、绝了、这也太、求链接），偶尔漏个标点或用个～也没事；\n"
+            f"6. 不要重复原帖内容，不要说教，更不要说自己是 AI 或助手；\n"
+            f"7. 偶尔（约两成）也可以只回一两个词或一个 emoji 表达情绪，不用硬凑句子；\n"
+            f"8. 直接输出回复内容，不要任何前缀、引号或解释。\n\n"
+            f"【本次语气方向】{style_text}"
         )
         user_prompt = (
             f"【帖子标题】{post_title or '(无标题)'}\n"
@@ -188,6 +215,7 @@ class AnthropicClient:
 
         所有变换均不改变语义主体，只是让文本更像真人随手打的：
           - 偶发轻微错别字（同音/形近，净效果不影响理解）
+          - 偶发开头语气词（啊/嗯/话说/其实/害）
           - 偶发追加 1 个随机 emoji
           - 偶发只保留前半句（短评更真实）
           - 偶发标点波动（去掉结尾句号 / 换成 ~ 或 ！）
@@ -198,37 +226,49 @@ class AnthropicClient:
         hz = hz or {}
         try:
             # 1) 偶发截断为短评（只留第一句 / 前 N 字）
-            if random.random() < float(hz.get("content_truncate_rate", 0.12)):
+            if random.random() < float(hz.get("content_truncate_rate", 0.18)):
                 cut = text.split("。")[0].split("！")[0].split("?")[0].split("？")[0]
                 cut = cut.strip()
-                if len(cut) >= 4:
+                if len(cut) >= 3:
                     text = cut
 
-            # 2) 偶发轻微错别字（同音/形近替换 1 处）
-            if random.random() < float(hz.get("content_typo_rate", 0.15)):
+            # 2) 偶发轻微错别字（真人常见口误，净效果不影响理解）
+            if random.random() < float(hz.get("content_typo_rate", 0.20)):
                 typo_map = [
                     ("的", "地"), ("地", "的"), ("在", "再"), ("再", "在"),
-                    ("吧", "把"), ("吗", "嘛"), ("呢", "呐"), ("这", "这"),
+                    ("吧", "把"), ("吗", "嘛"), ("呢", "呐"),
                     ("已", "以"), ("以", "已"), ("他", "她"), ("她", "他"),
+                    ("得", "的"), ("的", "得"), ("着", "这"), ("哪", "那"),
+                    ("做", "作"), ("像", "向"), ("么", "吗"),
                 ]
+                random.shuffle(typo_map)
                 for a, b in typo_map:
                     idx = text.find(a)
-                    if idx >= 0 and random.random() < 0.5:
+                    if idx >= 0:
                         text = text[:idx] + b + text[idx + len(a):]
                         break
 
-            # 3) 偶发追加 1 个随机 emoji
-            if random.random() < float(hz.get("content_emoji_rate", 0.50)):
-                emojis = ["😂", "✨", "🥺", "👍", "🔥", "💡", "🤔", "😭", "🌝", "🙈", "💯", "🥹"]
+            # 3) 偶发开头语气词（真人常有的口头禅，让句式不像「起承转合」的 AI 文）
+            if random.random() < 0.25:
+                filler = random.choice(["啊", "嗯", "话说", "其实", "害", "诶", "就是"])
+                if not text.startswith(tuple("啊嗯话说其实害诶就是")):
+                    text = f"{filler}{text}"
+
+            # 4) 偶发追加 1 个随机 emoji
+            if random.random() < float(hz.get("content_emoji_rate", 0.40)):
+                emojis = ["😂", "✨", "🥺", "👍", "🔥", "💡", "🤔", "😭", "🌝", "🙈", "💯", "🥹", "😅", "🫡"]
                 text = text.rstrip("。.!！?？~ ") + random.choice(emojis)
 
-            # 4) 偶发标点波动（去掉生硬结尾句号 / 换成 ~ 或 ！）
-            if random.random() < 0.35:
+            # 5) 偶发标点波动（去掉生硬结尾句号 / 换成 ~ 或 ！或啥都不加）
+            if random.random() < 0.45:
                 t = text.rstrip("。.!！?？~ ")
-                if random.random() < 0.5:
+                r = random.random()
+                if r < 0.4:
                     text = t + "～"
-                else:
+                elif r < 0.8:
                     text = t + "！"
+                else:
+                    text = t  # 直接收尾，无标点（真人很常见）
 
             return text.strip()
         except Exception:

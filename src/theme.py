@@ -26,6 +26,18 @@ COLORS = {
     "btn_start":      "#2D6CDF",
     "btn_stop":       "#E25C5C",
     "btn_hover":      "#494953",
+    # 按压态：比 btn_bg 更深，模拟 scale(0.97) 的视觉收缩感
+    # 参考 emil-design-eng: buttons must feel responsive (100-160ms)
+    "btn_pressed":    "#2E2E36",
+    "btn_start_pressed": "#2455B0",
+    "btn_stop_pressed":  "#B04848",
+
+    # 强调色：用于焦点、链接、活跃指示
+    "accent":         "#5AA9F0",
+    "accent_dim":     "#3D7FBF",
+
+    # 弹窗阴影色（模拟 depth，apple §12 Materials）
+    "shadow":         "#0D0D11",
 
     "border":         "#3A3A44",
     "border_focus":   "#5AA9F0",

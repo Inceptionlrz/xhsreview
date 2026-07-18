@@ -13,6 +13,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "api_key":       "",
     "api_model":     "claude-3-5-sonnet-20241022",
     "api_persona":   "友好、有趣、真实的小红书用户",
+    # 人设池：运营时从中随机轮换，打破「单一完美声音」指纹（留空则只用上面的 api_persona）
+    "persona_pool":  [
+        "一个爱逛小红书的普通女生，说话随意、爱用表情",
+        "有点社恐但热心的大学生，评论常常很简短",
+        "刚工作不久的打工人，偶尔吐槽偶尔种草",
+        "爱蹲好物的懒人党，看到有用的就马住",
+        "话不多但会认真看完帖子的路人",
+    ],
     "api_max_tokens": 256,
     "api_temperature": 0.85,
     "proxy":         "",
@@ -91,6 +99,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
         # —— AI 回复内容拟人（防「AI 味」与人工审核） ——
         "no_comment_rate":         25,     # % 概率「看了但不评论」（连 AI 调用都省，更自然）
+        # 通用反应：一定概率直接发一条真人常用口语反应（前排/蹲一个/收藏了/单个 emoji…），
+        # 跳过 AI 生成。这是抗「AI 运营」检测最有效的一招——此类低信息评论几乎不可能被判为 AI。
+        "generic_reply_rate":      45,     # % 概率发通用反应而非调用 AI（在「决定要评论」之后）
+        "content_min_post_len":    25,     # 帖子正文不足该字数时，强制走通用反应（内容太少无料可评）
+        "content_vary_voice":      True,   # 让 AI 每次随机切换语气（纯情绪/反问/含糊/共情/切题）
+        "persona_rotate":          True,   # 每帖从 persona_pool 随机选人设（打破单一声音指纹）
         "content_typo_rate":       0.20,   # 偶发轻微错别字（同音/形近，不影响理解）
         "content_emoji_rate":      0.40,   # 偶发追加 1 个随机 emoji（自然口语化）
         "content_truncate_rate":   0.18,   # 偶发只保留前半句（短评更真实）
@@ -109,6 +123,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
         # —— 操作顺序随机 ——
         "randomize_order":         True,   # 每帖随机决定「先赞后评 / 先评后赞 / 只做其一」
+    },
+
+    # === 养号模式（极低频 / 只看不评 / 随机长休息） ===
+    # 账号被平台判定为 AI 运营后的「冷启动」用：几乎只浏览、极少量点赞、绝不评论、
+    # 帖子间等待与长休息大幅拉长。开启后 scheduler 会用下面 nurture 覆盖关键参数。
+    "nurture_mode":  False,
+    "nurture": {
+        "auto_reply":          False,   # 只看不评
+        "auto_like":           True,    # 极低频点赞（配合下方 like_rate，每日仅约 3 次）
+        "like_rate":            3,      # 极低频点赞（每日仅约 3 次）
+        "skip_rate":           85,      # 绝大多数帖子纯浏览跳过
+        "wait_min":             8,      # 帖子间等待大幅拉长
+        "wait_max":            20,
+        "long_break_prob":     0.35,    # 更频繁地长休息（打乱节奏）
+        "long_break_min":     120,      # 长休息 2~7 分钟
+        "long_break_max":     420,
+        "session_action_cap":   4,      # 会话累计操作上限极低
+        "daily_like_limit":     3,      # 每日点赞上限（跨重启累计）
+        "daily_reply_limit":    0,      # 每日评论上限（养号期间为 0）
     },
 
     # === 板块（小红书真实板块） ===
